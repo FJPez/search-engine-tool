@@ -5,6 +5,7 @@ __pycache__/
 .coverage
 htmlcov/
 .DS_Store
+NOTES.md
 data/*.json
 data/*.pkl
 !data/.gitkeep
