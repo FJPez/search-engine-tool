@@ -64,6 +64,7 @@ pytest tests/test_indexer.py::test_name   # single test
 - Every commit must leave `make check` green (ruff, ty, pytest).
 - Use conventional-commit prefixes (`feat:`, `fix:`, `test:`, `docs:`, `chore:`, `refactor:`) scoped by module where relevant (e.g. `feat(crawler): ...`).
 - Tests live in the same commit as the code they cover, not a separate "add tests" commit at the end.
+- **Write tests as flat `test_*` functions, never grouped inside `Test*` classes.** Parametrise with `@pytest.mark.parametrize` rather than reaching for class-based organisation.
 - Never `--amend` or force-push a commit the user has already reviewed.
 
 ## Submission Artefacts
