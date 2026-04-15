@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from urllib.parse import urljoin, urlparse, urlunparse
 
+from bs4 import BeautifulSoup
+
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -72,3 +74,28 @@ def in_scope(url: str, allowed_netloc: str) -> bool:
     if host is None:
         return False
     return host == allowed_netloc.lower()
+
+
+def extract_links(html: str, page_url: str) -> list[str]:
+    """Return the deduplicated list of canonical crawlable URLs in *html*.
+
+    Parses *html* with BeautifulSoup using the ``lxml`` backend, collects every
+    ``<a>`` element that has an ``href`` attribute, resolves relative URLs
+    against *page_url*, and drops anything :func:`canonicalise` rejects
+    (``mailto:``, ``javascript:``, empty hrefs, ...). Order is preserved to
+    match the order of first appearance in the document, which gives the
+    breadth-first crawl a predictable traversal order.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    seen: set[str] = set()
+    result: list[str] = []
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        canonical = canonicalise(str(href), base=page_url)
+        if canonical is None or canonical in seen:
+            continue
+        seen.add(canonical)
+        result.append(canonical)
+    return result
