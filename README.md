@@ -2,6 +2,11 @@
 
 COMP3011 Coursework 2 — a Python CLI search engine that crawls [quotes.toscrape.com](https://quotes.toscrape.com/), builds an inverted index, and answers single- and multi-word queries.
 
+## Status
+
+- ✅ Crawler ([`src/crawler.py`](src/crawler.py)) — breadth-first, single-host, 6 s politeness window, retry-aware, fully unit-tested with mocked HTTP.
+- ⏳ Indexer, search, CLI — not yet implemented.
+
 ## Setup
 
 Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).

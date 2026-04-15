@@ -1,16 +1,46 @@
-"""Polite, depth-limited crawler for the COMP3011 search-engine-tool.
+"""Polite, breadth-first web crawler for the COMP3011 search-engine-tool.
 
-This module will eventually expose a ``PoliteCrawler`` class that yields
-``(canonical_url, raw_html)`` pairs for every in-scope page reachable from a
-seed URL, enforcing the brief's ≥6 s politeness window between requests.
+The module owns every piece of network I/O in the project. Everything
+downstream — tokenisation, indexing, search — operates on the
+``(canonical_url, raw_html)`` pairs this crawler produces.
 
-The two-pass tokenization pipeline (identify markup, then extract words) lives
-entirely in :mod:`src.indexer`; this module owns all network I/O and never
-strips or interprets HTML beyond link extraction.
+Public API
+----------
 
-For now, the module exports only the pure URL helpers used by the crawler:
-:func:`canonicalise` and :func:`in_scope`. The crawler class will follow in
-later commits.
+* :class:`PoliteCrawler` — the main entry point. Seeded with a start URL,
+  it performs a breadth-first traversal over a single host and yields
+  ``(canonical_url, html)`` for every successful in-scope fetch. The brief's
+  ≥6 s politeness window is enforced inside the crawl loop using an injected
+  ``sleep`` / ``clock`` pair, so unit tests can assert on timing without
+  waiting on wall-clock. See the class docstring for the full retry and
+  scope policy.
+
+* :func:`canonicalise` — normalise a URL into a single canonical form
+  (lowercased scheme and host, default ports dropped, fragments stripped,
+  non-root trailing slashes collapsed). Returns ``None`` for anything that
+  can't be crawled (``mailto:``, ``javascript:``, empty inputs, ...).
+
+* :func:`in_scope` — exact-host scope check; no subdomain walking.
+
+* :func:`extract_links` — parse HTML via BeautifulSoup + ``lxml`` and return
+  the deduplicated, order-preserving list of canonical crawlable URLs.
+
+Design constraints
+------------------
+
+* **HTML contract.** The crawler yields *raw* HTML strings. The two-pass
+  tokenisation pipeline (identify markup, then extract words from useful
+  regions) lives entirely in :mod:`src.indexer`. Keeping parsing decisions
+  out of the crawler means indexer changes never force a re-crawl.
+
+* **Politeness by default.** The default ``delay`` of 6 s matches the
+  brief's hard requirement. The politeness window is measured from the end
+  of one fetch to the start of the next, so the target server is guaranteed
+  a full quiet interval between responses.
+
+* **Testability via dependency injection.** ``sleep``, ``clock`` and
+  ``session`` are all injectable constructor parameters. Production callers
+  never pass them; tests always do.
 """
 
 from __future__ import annotations
