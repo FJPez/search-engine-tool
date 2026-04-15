@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterator
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -138,8 +139,11 @@ class PoliteCrawler:
     ``clock`` callables so unit tests can assert on politeness timing without
     actually waiting.
 
-    Only the network-I/O half (``_fetch``) is wired up in this commit; the
-    BFS ``crawl`` loop lands in the next commit.
+    The BFS ``crawl`` loop calls :meth:`fetch` for each URL it takes from the
+    frontier, yields successful pages, and enqueues any in-scope links it
+    discovers. The politeness window is enforced between fetches using the
+    injected ``clock`` and ``sleep`` callables so tests can verify timing
+    without wall-clock waits.
     """
 
     def __init__(
@@ -217,3 +221,61 @@ class PoliteCrawler:
             return None
 
         return None  # unreachable; keeps static checkers happy
+
+    def crawl(self) -> Iterator[tuple[str, str]]:
+        """Yield ``(canonical_url, html)`` for every in-scope reachable page.
+
+        Performs a breadth-first traversal from the seed URL, enforcing a
+        minimum ``delay`` seconds between successive fetches and skipping any
+        URL whose host differs from the seed's host. Stops after
+        ``max_pages`` successful yields if that limit was set.
+
+        The politeness window is enforced from the *end* of one fetch to the
+        *start* of the next — so 6 s of real quiet between the server sending
+        its previous response and us sending the next request. This is the
+        stricter of the two common readings of "6 s between requests" and
+        keeps us well clear of the brief's threshold.
+        """
+        start_canonical = canonicalise(self._start_url)
+        if start_canonical is None:
+            logger.warning("Start URL %r is not crawlable; nothing to yield", self._start_url)
+            return
+
+        allowed_host = urlparse(start_canonical).hostname or ""
+        visited: set[str] = set()
+        frontier: deque[str] = deque([start_canonical])
+        last_fetch_end: float | None = None
+        yielded = 0
+
+        while frontier:
+            if self._max_pages is not None and yielded >= self._max_pages:
+                return
+
+            url = frontier.popleft()
+            if url in visited:
+                continue
+            visited.add(url)
+
+            if last_fetch_end is not None:
+                elapsed = self._clock() - last_fetch_end
+                if elapsed < self._delay:
+                    self._sleep(self._delay - elapsed)
+
+            result = self.fetch(url)
+            last_fetch_end = self._clock()
+            if result is None:
+                continue
+
+            final_url, html = result
+            canonical_final = canonicalise(final_url)
+            if canonical_final is None or not in_scope(canonical_final, allowed_host):
+                continue
+            visited.add(canonical_final)
+
+            yield canonical_final, html
+            yielded += 1
+
+            for link in extract_links(html, canonical_final):
+                if link in visited or not in_scope(link, allowed_host):
+                    continue
+                frontier.append(link)
