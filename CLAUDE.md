@@ -58,6 +58,14 @@ pytest                     # run full test suite
 pytest tests/test_indexer.py::test_name   # single test
 ```
 
+## Commit Discipline
+
+- Work lands in **small, independently reviewable commits**. The user reviews each commit before the next is written — do not batch unrelated changes.
+- Every commit must leave `make check` green (ruff, ty, pytest).
+- Use conventional-commit prefixes (`feat:`, `fix:`, `test:`, `docs:`, `chore:`, `refactor:`) scoped by module where relevant (e.g. `feat(crawler): ...`).
+- Tests live in the same commit as the code they cover, not a separate "add tests" commit at the end.
+- Never `--amend` or force-push a commit the user has already reviewed.
+
 ## Submission Artefacts
 
 Three things go to Minerva: video link (unlisted, not private; test in incognito), public GitHub URL, and the compiled index file. README must cover overview, setup, usage for all four commands, testing instructions, and dependencies.
