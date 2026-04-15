@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
+from collections.abc import Callable
 
-from src.crawler import canonicalise, extract_links, in_scope
+import pytest
+import requests
+from requests_mock import Mocker
+
+from src.crawler import PoliteCrawler, canonicalise, extract_links, in_scope
 
 
 @pytest.mark.parametrize(
@@ -209,3 +213,161 @@ def test_extract_links_tolerates_malformed_html() -> None:
 @pytest.mark.parametrize("html", ["", "<html></html>", "<html><body></body></html>"])
 def test_extract_links_empty_returns_empty_list(html: str) -> None:
     assert extract_links(html, "http://quotes.toscrape.com/") == []
+
+
+# --- PoliteCrawler.fetch -----------------------------------------------------
+
+URL = "http://quotes.toscrape.com/"
+
+
+CrawlerFactory = Callable[..., PoliteCrawler]
+
+
+@pytest.fixture
+def crawler_factory() -> CrawlerFactory:
+    """Build a :class:`PoliteCrawler` with an injected no-op or spy sleep.
+
+    Pass ``sleep_calls=[]`` to capture back-off timings, or nothing for a
+    default crawler whose sleep is a silent no-op so tests never actually
+    block.
+    """
+
+    def _factory(
+        *,
+        delay: float = 6.0,
+        sleep_calls: list[float] | None = None,
+    ) -> PoliteCrawler:
+        sleep: Callable[[float], None] = (
+            sleep_calls.append if sleep_calls is not None else (lambda _s: None)
+        )
+        return PoliteCrawler(URL, delay=delay, sleep=sleep)
+
+    return _factory
+
+
+def test_fetch_success_returns_final_url_and_text(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(URL, text="<html>hello</html>", status_code=200)
+    assert crawler_factory().fetch(URL) == (URL, "<html>hello</html>")
+
+
+def test_fetch_sends_user_agent_header(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(URL, text="ok")
+    crawler_factory().fetch(URL)
+    assert requests_mock.last_request is not None
+    assert "COMP3011-SearchEngineTool" in requests_mock.last_request.headers["User-Agent"]
+
+
+def test_fetch_retries_500_then_succeeds(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(
+        URL,
+        [
+            {"status_code": 500},
+            {"status_code": 200, "text": "recovered"},
+        ],
+    )
+    assert crawler_factory().fetch(URL) == (URL, "recovered")
+
+
+def test_fetch_gives_up_after_repeated_5xx(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(URL, [{"status_code": 500}, {"status_code": 500}])
+    assert crawler_factory().fetch(URL) is None
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_fetch_skips_permanent_client_errors_without_retry(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory, status: int
+) -> None:
+    requests_mock.get(URL, status_code=status)
+    assert crawler_factory().fetch(URL) is None
+    # Should not have retried — exactly one request.
+    assert requests_mock.call_count == 1
+
+
+def test_fetch_429_with_retry_after_backs_off_then_succeeds(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    sleep_calls: list[float] = []
+    crawler = crawler_factory(delay=6.0, sleep_calls=sleep_calls)
+    requests_mock.get(
+        URL,
+        [
+            {"status_code": 429, "headers": {"Retry-After": "10"}},
+            {"status_code": 200, "text": "ok"},
+        ],
+    )
+    assert crawler.fetch(URL) == (URL, "ok")
+    # Retry-After (10) was larger than delay (6), so the bigger value wins.
+    assert sleep_calls == [10.0]
+
+
+def test_fetch_429_honours_delay_when_retry_after_is_smaller(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    sleep_calls: list[float] = []
+    crawler = crawler_factory(delay=6.0, sleep_calls=sleep_calls)
+    requests_mock.get(
+        URL,
+        [
+            {"status_code": 429, "headers": {"Retry-After": "1"}},
+            {"status_code": 200, "text": "ok"},
+        ],
+    )
+    crawler.fetch(URL)
+    assert sleep_calls == [6.0]
+
+
+def test_fetch_gives_up_after_repeated_429(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(URL, [{"status_code": 429}, {"status_code": 429}])
+    assert crawler_factory().fetch(URL) is None
+
+
+def test_fetch_retries_connection_error_then_succeeds(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(
+        URL,
+        [
+            {"exc": requests.ConnectionError("network down")},
+            {"status_code": 200, "text": "ok"},
+        ],
+    )
+    assert crawler_factory().fetch(URL) == (URL, "ok")
+
+
+def test_fetch_gives_up_after_repeated_timeout(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    requests_mock.get(URL, exc=requests.Timeout("slow"))
+    assert crawler_factory().fetch(URL) is None
+
+
+def test_fetch_follows_redirect_and_returns_final_url(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    target = "http://quotes.toscrape.com/page/2"
+    requests_mock.get(URL, status_code=301, headers={"Location": target})
+    requests_mock.get(target, text="final page", status_code=200)
+    result = crawler_factory().fetch(URL)
+    assert result is not None
+    final_url, html = result
+    assert final_url == target
+    assert html == "final page"
+
+
+def test_fetch_skips_unexpected_status_code(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    # 418 is not permanent-skip, not retryable, not 429 — we log and skip.
+    requests_mock.get(URL, status_code=418)
+    assert crawler_factory().fetch(URL) is None
+    assert requests_mock.call_count == 1
