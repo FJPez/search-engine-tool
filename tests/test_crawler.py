@@ -521,3 +521,47 @@ def test_crawl_yields_final_url_after_redirect(
     requests_mock.get(target, text=_html_with_links(), status_code=200)
     results = [url for url, _ in crawler_factory().crawl()]
     assert results == [target]
+
+
+def test_crawl_locks_redirect_to_seed_scheme(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    # Regression test: quotes.toscrape.com sometimes redirects https:// to
+    # http:// for author pages. A scheme downgrade must NOT leak into the
+    # yielded URLs — every canonical URL stays on the seed's scheme so the
+    # visited set and the indexer see one form per logical page.
+    https_seed = "https://quotes.toscrape.com/"
+    https_author = "https://quotes.toscrape.com/author/einstein"
+    http_author = "http://quotes.toscrape.com/author/einstein"
+    requests_mock.get(https_seed, text=_html_with_links("/author/einstein"))
+    requests_mock.get(
+        https_author,
+        status_code=301,
+        headers={"Location": http_author},
+    )
+    requests_mock.get(http_author, text=_html_with_links(), status_code=200)
+
+    crawler = crawler_factory(start_url=https_seed)
+    results = [url for url, _ in crawler.crawl()]
+    assert results == [https_seed, https_author]
+
+
+def test_crawl_rewrites_absolute_http_link_to_seed_https(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    # An HTML page can contain an absolute http:// link even when the seed
+    # is https://. The crawler must rewrite the scheme before fetching so
+    # the target is requested consistently with the rest of the crawl.
+    https_seed = "https://quotes.toscrape.com/"
+    https_about = "https://quotes.toscrape.com/about"
+    requests_mock.get(
+        https_seed,
+        text=_html_with_links("http://quotes.toscrape.com/about"),
+    )
+    requests_mock.get(https_about, text=_html_with_links(), status_code=200)
+    # If the crawler instead tried http://quotes.toscrape.com/about,
+    # requests_mock would raise NoMockAddress and this test would fail.
+
+    crawler = crawler_factory(start_url=https_seed)
+    results = [url for url, _ in crawler.crawl()]
+    assert results == [https_seed, https_about]

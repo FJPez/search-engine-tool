@@ -145,6 +145,22 @@ def extract_links(html: str, page_url: str) -> list[str]:
     return result
 
 
+def _force_scheme(url: str, scheme: str) -> str:
+    """Return *url* with its scheme replaced by *scheme*.
+
+    Used by :meth:`PoliteCrawler.crawl` to lock every canonical URL onto the
+    seed's scheme. Sites such as ``quotes.toscrape.com`` sometimes redirect
+    ``https://`` requests to ``http://`` (or vice versa), and absolute links
+    inside HTML can disagree with the seed's scheme. Without this
+    normalisation the visited set would see two entries for the same logical
+    page and the yielded stream would contain mixed schemes.
+    """
+    parsed = urlparse(url)
+    return urlunparse(
+        (scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+    )
+
+
 def _parse_retry_after(value: str | None) -> float:
     """Parse an HTTP ``Retry-After`` header as seconds. Return ``0`` on failure.
 
@@ -271,7 +287,9 @@ class PoliteCrawler:
             logger.warning("Start URL %r is not crawlable; nothing to yield", self._start_url)
             return
 
-        allowed_host = urlparse(start_canonical).hostname or ""
+        start_parsed = urlparse(start_canonical)
+        allowed_host = start_parsed.hostname or ""
+        start_scheme = start_parsed.scheme  # locked for the lifetime of this crawl
         visited: set[str] = set()
         frontier: deque[str] = deque([start_canonical])
         last_fetch_end: float | None = None
@@ -300,12 +318,19 @@ class PoliteCrawler:
             canonical_final = canonicalise(final_url)
             if canonical_final is None or not in_scope(canonical_final, allowed_host):
                 continue
+            # Lock onto the seed's scheme so a redirect that downgrades
+            # https→http (or upgrades http→https) doesn't leak a second
+            # canonical form for the same logical page.
+            canonical_final = _force_scheme(canonical_final, start_scheme)
             visited.add(canonical_final)
 
             yield canonical_final, html
             yielded += 1
 
-            for link in extract_links(html, canonical_final):
-                if link in visited or not in_scope(link, allowed_host):
+            for raw_link in extract_links(html, canonical_final):
+                if not in_scope(raw_link, allowed_host):
+                    continue
+                link = _force_scheme(raw_link, start_scheme)
+                if link in visited:
                     continue
                 frontier.append(link)
