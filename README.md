@@ -57,4 +57,5 @@ uv run pytest --cov=src    # with coverage
 
 - `requests` — HTTP client
 - `beautifulsoup4` — HTML parsing
-- `pytest`, `pytest-cov` — testing (dev)
+- `lxml` — fast parser backend for BeautifulSoup
+- `pytest`, `pytest-cov`, `requests-mock` — testing (dev)

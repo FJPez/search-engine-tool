@@ -156,9 +156,10 @@ def _force_scheme(url: str, scheme: str) -> str:
     page and the yielded stream would contain mixed schemes.
     """
     parsed = urlparse(url)
-    return urlunparse(
-        (scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
-    )
+    # Fragment is zeroed defensively — callers are expected to pass URLs that
+    # have already been through canonicalise (which strips fragments), but
+    # this avoids a subtle bug if that precondition is ever violated.
+    return urlunparse((scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
 
 
 def _parse_retry_after(value: str | None) -> float:
@@ -232,7 +233,7 @@ class PoliteCrawler:
         for attempt in (1, 2):
             try:
                 response = self._session.get(url, timeout=self._timeout)
-            except (requests.ConnectionError, requests.Timeout) as exc:
+            except requests.RequestException as exc:
                 logger.warning("Network error fetching %s (attempt %d): %s", url, attempt, exc)
                 if attempt == 2:
                     return None

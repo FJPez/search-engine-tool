@@ -95,6 +95,7 @@ def test_canonicalise_returns_canonical_form(url: str, base: str | None, expecte
         "javascript:void(0)",
         "tel:+441234567890",
         "ftp://quotes.toscrape.com/file",
+        "http://",  # valid scheme but no host
     ],
 )
 def test_canonicalise_rejects_uncrawlable_schemes(url: str) -> None:
@@ -339,6 +340,27 @@ def test_fetch_429_honours_delay_when_retry_after_is_smaller(
     assert sleep_calls == [6.0]
 
 
+def test_fetch_429_with_http_date_retry_after_falls_back_to_delay(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    # Retry-After can legally be an HTTP-date; we only parse delta-seconds,
+    # so the unparseable value falls back to 0 and the delay wins via max().
+    sleep_calls: list[float] = []
+    crawler = crawler_factory(delay=6.0, sleep_calls=sleep_calls)
+    requests_mock.get(
+        BASE_URL,
+        [
+            {
+                "status_code": 429,
+                "headers": {"Retry-After": "Thu, 01 Dec 2025 16:00:00 GMT"},
+            },
+            {"status_code": 200, "text": "ok"},
+        ],
+    )
+    assert crawler.fetch(BASE_URL) == (BASE_URL, "ok")
+    assert sleep_calls == [6.0]  # delay wins because parsed Retry-After → 0
+
+
 def test_fetch_gives_up_after_repeated_429(
     requests_mock: Mocker, crawler_factory: CrawlerFactory
 ) -> None:
@@ -483,6 +505,24 @@ def test_crawl_dedupes_visited_urls(requests_mock: Mocker, crawler_factory: Craw
     assert requests_mock.call_count == 2
 
 
+def test_crawl_dedupes_url_enqueued_from_two_pages(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    # Both /a and /b link to /c. /c enters the frontier twice; the second
+    # pop must hit the `if url in visited: continue` guard, not re-fetch.
+    a = f"{BASE_URL}a"
+    b = f"{BASE_URL}b"
+    c = f"{BASE_URL}c"
+    requests_mock.get(BASE_URL, text=_html_with_links(a, b))
+    requests_mock.get(a, text=_html_with_links(c))
+    requests_mock.get(b, text=_html_with_links(c))
+    requests_mock.get(c, text=_html_with_links())
+    results = [url for url, _ in crawler_factory().crawl()]
+    assert results == [BASE_URL, a, b, c]
+    # /c fetched exactly once, not twice.
+    assert requests_mock.call_count == 4
+
+
 def test_crawl_respects_max_pages_cap(
     requests_mock: Mocker, crawler_factory: CrawlerFactory
 ) -> None:
@@ -521,6 +561,22 @@ def test_crawl_yields_final_url_after_redirect(
     requests_mock.get(target, text=_html_with_links(), status_code=200)
     results = [url for url, _ in crawler_factory().crawl()]
     assert results == [target]
+
+
+def test_crawl_skips_page_when_redirect_leaves_scope(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    # A link is in scope, but the server redirects it to an off-domain host.
+    # The crawler should silently skip it and continue with other links.
+    a = f"{BASE_URL}a"
+    b = f"{BASE_URL}b"
+    off_domain = "http://other.example.com/landing"
+    requests_mock.get(BASE_URL, text=_html_with_links(a, b))
+    requests_mock.get(a, status_code=301, headers={"Location": off_domain})
+    requests_mock.get(off_domain, text="off domain", status_code=200)
+    requests_mock.get(b, text=_html_with_links(), status_code=200)
+    results = [url for url, _ in crawler_factory().crawl()]
+    assert results == [BASE_URL, b]  # /a skipped, /b still yielded
 
 
 def test_crawl_locks_redirect_to_seed_scheme(
