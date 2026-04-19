@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from src.indexer import tokenise
+from src.indexer import extract_fields, tokenise
+
+
+def _html(title: str = "", body: str = "") -> str:
+    """Build a minimal HTML document with optional title and body."""
+    title_tag = f"<title>{title}</title>" if title else ""
+    return f"<!doctype html><html><head>{title_tag}</head><body>{body}</body></html>"
 
 
 @pytest.mark.parametrize(
@@ -62,3 +68,60 @@ def test_tokenise_is_idempotent_on_its_own_output() -> None:
     once = tokenise(text)
     twice = tokenise(" ".join(once))
     assert once == twice
+
+
+# --------------------------------------------------------------------------
+# extract_fields
+# --------------------------------------------------------------------------
+
+
+def test_extract_fields_title_and_body() -> None:
+    result = extract_fields(_html(title="Quotes to Scrape", body="<p>Hello world</p>"))
+    assert result["title"] == "Quotes to Scrape"
+    assert "Hello world" in result["body"]
+    # Title is not duplicated into the body stream
+    assert "Quotes to Scrape" not in result["body"]
+
+
+def test_extract_fields_missing_title_is_empty_string() -> None:
+    result = extract_fields(_html(body="<p>no title here</p>"))
+    assert result["title"] == ""
+    assert "no title here" in result["body"]
+
+
+def test_extract_fields_strips_script_and_style_and_noscript() -> None:
+    body = (
+        "<script>var secret='indexthis';</script>"
+        "<style>.a { content: 'cssleak'; }</style>"
+        "<noscript>enable javascript</noscript>"
+        "<p>real content</p>"
+    )
+    result = extract_fields(_html(title="T", body=body))
+    assert "real content" in result["body"]
+    for leaked in ("secret", "indexthis", "cssleak", "enable javascript"):
+        assert leaked not in result["body"]
+
+
+def test_extract_fields_flattens_nested_inline_tags() -> None:
+    # Adjacent inline tags must not glue into a single word
+    result = extract_fields(_html(body="<p>hello <b>world</b></p>"))
+    body_tokens = tokenise(result["body"])
+    assert body_tokens == ["hello", "world"]
+
+
+def test_extract_fields_tolerates_malformed_html() -> None:
+    # lxml should recover gracefully; we only require no exception + sane body
+    result = extract_fields("<html><body><p>oops <b>unclosed</p></body>")
+    assert "oops" in result["body"]
+    assert "unclosed" in result["body"]
+
+
+def test_extract_fields_empty_input() -> None:
+    result = extract_fields("")
+    assert result == {"title": "", "body": ""}
+
+
+def test_extract_fields_whitespace_only_title_is_empty() -> None:
+    # <title>   </title> should not leak whitespace into the title field
+    result = extract_fields(_html(title="   ", body="content"))
+    assert result["title"] == ""
