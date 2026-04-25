@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.indexer import extract_fields, tokenise
+from src.indexer import Document, InvertedIndex, Posting, extract_fields, tokenise
 
 
 def _html(title: str = "", body: str = "") -> str:
@@ -125,3 +125,137 @@ def test_extract_fields_whitespace_only_title_is_empty() -> None:
     # <title>   </title> should not leak whitespace into the title field
     result = extract_fields(_html(title="   ", body="content"))
     assert result["title"] == ""
+
+
+# --------------------------------------------------------------------------
+# InvertedIndex.add_document / lookup / field_of
+# --------------------------------------------------------------------------
+
+
+def test_add_document_returns_sequential_doc_ids() -> None:
+    idx = InvertedIndex()
+    assert idx.add_document("http://a/", _html(body="alpha")) == 0
+    assert idx.add_document("http://b/", _html(body="beta")) == 1
+    assert idx.add_document("http://c/", _html(body="gamma")) == 2
+    assert len(idx) == 3
+
+
+def test_add_document_is_idempotent_on_url() -> None:
+    idx = InvertedIndex()
+    first = idx.add_document("http://dup/", _html(body="hello world"))
+    second = idx.add_document("http://dup/", _html(body="something else entirely"))
+    assert first == second
+    assert len(idx) == 1
+    # The second call must not re-tokenise: posting list for "hello" should
+    # still point at one doc with count 1 — not doubled, not replaced.
+    postings = idx.lookup("hello")
+    assert len(postings) == 1
+    assert postings[0].count == 1
+    # And the later body ("something") never got indexed
+    assert idx.lookup("something") == []
+
+
+def test_lookup_counts_and_positions_for_single_document() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(title="T", body="good good friends"))
+    # Stream: [T, good, good, friends] -> positions 0, 1, 2, 3
+    good = idx.lookup("good")
+    assert good == [Posting(doc_id=0, count=2, positions=(1, 2))]
+    assert idx.lookup("friends") == [Posting(doc_id=0, count=1, positions=(3,))]
+    assert idx.lookup("t") == [Posting(doc_id=0, count=1, positions=(0,))]
+
+
+def test_lookup_aggregates_across_documents_sorted_by_doc_id() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://a/", _html(body="good good"))
+    idx.add_document("http://b/", _html(body="bad"))
+    idx.add_document("http://c/", _html(body="good"))
+    good = idx.lookup("good")
+    assert [p.doc_id for p in good] == [0, 2]
+    assert good[0].count == 2
+    assert good[1].count == 1
+
+
+def test_lookup_is_case_insensitive_on_query() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="Hello World"))
+    assert idx.lookup("HELLO") == idx.lookup("hello")
+    assert idx.lookup("Hello")[0].count == 1
+
+
+def test_lookup_unknown_word_returns_empty_list() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="only this word"))
+    assert idx.lookup("absent") == []
+
+
+def test_contains_is_case_insensitive() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="Indifference"))
+    assert "indifference" in idx
+    assert "INDIFFERENCE" in idx
+    assert "missing" not in idx
+    # Non-string comparisons don't explode
+    assert 42 not in idx
+
+
+def test_field_extents_mark_title_before_body() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(title="alpha beta", body="gamma delta"))
+    doc = idx.documents[0]
+    assert doc.fields == {"title": (0, 2), "body": (2, 4)}
+
+
+def test_field_of_resolves_title_and_body_positions() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(title="alpha beta", body="gamma"))
+    # Positions 0-1 are title, 2 is body
+    assert idx.field_of(0, 0) == "title"
+    assert idx.field_of(0, 1) == "title"
+    assert idx.field_of(0, 2) == "body"
+    # Outside any extent -> None
+    assert idx.field_of(0, 99) is None
+    # Unknown doc -> None
+    assert idx.field_of(999, 0) is None
+
+
+def test_field_of_reports_title_when_term_appears_in_title() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(title="unique headline", body="filler words"))
+    posting = idx.lookup("unique")[0]
+    assert idx.field_of(posting.doc_id, posting.positions[0]) == "title"
+
+
+def test_documents_property_is_a_defensive_copy() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="x"))
+    snapshot = idx.documents
+    snapshot[999] = Document(doc_id=999, url="http://evil/", fields={})
+    # Mutating the snapshot must not affect the real catalogue
+    assert 999 not in idx.documents
+    assert len(idx) == 1
+
+
+def test_empty_document_tokenises_to_no_postings() -> None:
+    idx = InvertedIndex()
+    doc_id = idx.add_document("http://empty/", _html())
+    assert doc_id == 0
+    assert len(idx) == 1
+    # Empty title + empty body => both extents collapse to (0, 0)
+    assert idx.documents[0].fields == {"title": (0, 0), "body": (0, 0)}
+
+
+def test_unicode_tokens_round_trip_through_the_index() -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="café naïve"))
+    assert idx.lookup("café")[0].count == 1
+    assert idx.lookup("naïve")[0].count == 1
+
+
+def test_apostrophe_stripping_applied_during_indexing() -> None:
+    # Query must use the post-tokenisation form (same rule search.py will
+    # follow): "can't" tokenises to ["cant"], so that's what we look up.
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="I can't see why"))
+    assert idx.lookup("cant")[0].count == 1
+    assert idx.lookup("can't") == []

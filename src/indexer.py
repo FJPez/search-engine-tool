@@ -5,14 +5,16 @@ produces an on-disk inverted index. Tokenisation, field extraction and the
 index data structure all live here so that future changes to parsing never
 require a re-crawl.
 
-The first two increments expose :func:`tokenise` and :func:`extract_fields`;
-the rest of the public surface (``Posting``, ``Document``, ``InvertedIndex``,
-``build_from_crawler``) lands in subsequent commits.
+Public API so far: :func:`tokenise`, :func:`extract_fields`, :class:`Posting`,
+:class:`Document`, :class:`InvertedIndex`. Persistence (``save``/``load``) and
+the :func:`build_from_crawler` convenience land in follow-up commits.
 """
 
 from __future__ import annotations
 
 import re
+from collections import defaultdict
+from dataclasses import dataclass, field
 
 from bs4 import BeautifulSoup
 
@@ -80,3 +82,138 @@ def extract_fields(html: str) -> dict[str, str]:
 
     body = soup.get_text(separator=" ")
     return {"title": title, "body": body}
+
+
+@dataclass(frozen=True, slots=True)
+class Posting:
+    """One inverted-index entry: a term's occurrences inside a single doc.
+
+    ``positions`` are token indices into that document's concatenated
+    ``title + body`` stream, 0-indexed. ``count`` is redundant with
+    ``len(positions)`` but cached so query code can read it without a
+    ``len`` call and so a position-less variant could be swapped in later
+    without breaking the field shape.
+    """
+
+    doc_id: int
+    count: int
+    positions: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Document:
+    """An entry in the document catalogue (NOTES.md L12 p.9).
+
+    ``fields`` maps a field name (``"title"``, ``"body"``) to its half-open
+    extent ``(start, end)`` inside the document's token stream. Extents are
+    recorded once per document rather than per posting so positions in the
+    posting list stay a single flat list.
+    """
+
+    doc_id: int
+    url: str
+    fields: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+
+class InvertedIndex:
+    """In-memory inverted index with a document catalogue.
+
+    Exposes the minimum surface the search layer needs: :meth:`add_document`
+    to ingest a crawled page, :meth:`lookup` to fetch a term's posting list
+    (sorted by ``doc_id``, so the later two-pointer intersection in
+    ``search.py`` just works — NOTES.md L13 p.12), :meth:`field_of` to
+    recover the field containing a given token position, and the
+    :attr:`documents` catalogue for turning ``doc_id`` back into a URL.
+    """
+
+    def __init__(self) -> None:
+        self._documents: dict[int, Document] = {}
+        self._url_to_id: dict[str, int] = {}
+        self._postings: dict[str, list[Posting]] = {}
+        self._next_id: int = 0
+
+    def add_document(self, url: str, html: str) -> int:
+        """Tokenise *html*, assign a new ``doc_id``, update postings.
+
+        Idempotent on URL: re-adding the same URL returns the existing
+        ``doc_id`` without re-indexing. That guards against the crawler
+        yielding the same canonical URL twice (redirect edge cases).
+        """
+        if url in self._url_to_id:
+            return self._url_to_id[url]
+
+        fields = extract_fields(html)
+        title_tokens = tokenise(fields["title"])
+        body_tokens = tokenise(fields["body"])
+
+        title_end = len(title_tokens)
+        body_end = title_end + len(body_tokens)
+        extents: dict[str, tuple[int, int]] = {
+            "title": (0, title_end),
+            "body": (title_end, body_end),
+        }
+
+        doc_id = self._next_id
+        self._next_id += 1
+
+        self._documents[doc_id] = Document(doc_id=doc_id, url=url, fields=extents)
+        self._url_to_id[url] = doc_id
+
+        # Build per-term position lists in one pass over the combined stream,
+        # then materialise the Posting. ``defaultdict(list)`` keeps the inner
+        # append loop tight and avoids a membership check per token.
+        positions_by_term: dict[str, list[int]] = defaultdict(list)
+        for position, token in enumerate(title_tokens):
+            positions_by_term[token].append(position)
+        for offset, token in enumerate(body_tokens):
+            positions_by_term[token].append(title_end + offset)
+
+        for term, positions in positions_by_term.items():
+            posting = Posting(doc_id=doc_id, count=len(positions), positions=tuple(positions))
+            # Documents are added in strictly increasing ``doc_id`` order, so
+            # appending preserves the by-``doc_id`` sort invariant the search
+            # layer relies on without an explicit resort.
+            self._postings.setdefault(term, []).append(posting)
+
+        return doc_id
+
+    def lookup(self, word: str) -> list[Posting]:
+        """Return the posting list for *word*, or ``[]`` if absent.
+
+        The query is lowercased to keep lookups case-insensitive (brief rule)
+        without forcing callers to normalise. Apostrophes aren't stripped
+        here because the indexed tokens already have them removed — a query
+        like ``"can't"`` should go through :func:`tokenise` first, which
+        yields ``["cant"]``; the raw string passed in here is treated as a
+        single already-tokenised term.
+        """
+        return self._postings.get(word.lower(), [])
+
+    def field_of(self, doc_id: int, position: int) -> str | None:
+        """Return the field name containing *position* in *doc_id*.
+
+        ``None`` if *doc_id* is unknown or *position* lies outside every
+        field extent. Used by future ranking to weight title hits.
+        """
+        document = self._documents.get(doc_id)
+        if document is None:
+            return None
+        for name, (start, end) in document.fields.items():
+            if start <= position < end:
+                return name
+        return None
+
+    @property
+    def documents(self) -> dict[int, Document]:
+        """Read-only view of the ``doc_id → Document`` catalogue."""
+        # Copy shields the internal dict from mutation by callers. Cheap at
+        # the scale this coursework operates on (tens of pages).
+        return dict(self._documents)
+
+    def __len__(self) -> int:
+        return len(self._documents)
+
+    def __contains__(self, word: object) -> bool:
+        if not isinstance(word, str):
+            return False
+        return word.lower() in self._postings
