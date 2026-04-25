@@ -6,17 +6,25 @@ index data structure all live here so that future changes to parsing never
 require a re-crawl.
 
 Public API so far: :func:`tokenise`, :func:`extract_fields`, :class:`Posting`,
-:class:`Document`, :class:`InvertedIndex`. Persistence (``save``/``load``) and
-the :func:`build_from_crawler` convenience land in follow-up commits.
+:class:`Document`, :class:`InvertedIndex` (with ``save`` / ``load``). The
+:func:`build_from_crawler` convenience lands in a follow-up commit.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from bs4 import BeautifulSoup
+
+# Bumped whenever the on-disk JSON shape changes in a way that older loaders
+# can't handle. Loading a file with a different version is a hard error: it
+# is safer to refuse than to silently misinterpret stored fields.
+_INDEX_VERSION = 1
 
 # Tags whose text content is never meaningful for search. Removing them up
 # front keeps the body stream clean of JS payloads, CSS rules and <noscript>
@@ -217,3 +225,147 @@ class InvertedIndex:
         if not isinstance(word, str):
             return False
         return word.lower() in self._postings
+
+    # ----------------------------------------------------------------------
+    # Persistence
+    # ----------------------------------------------------------------------
+
+    def save(self, path: str | Path) -> None:
+        """Serialise the index to *path* as JSON.
+
+        JSON is the deliberate choice over pickle: the compiled index file
+        is a graded submission artefact, JSON is human-inspectable
+        (``less data/index.json``) and safe to load. Parent directories are
+        created on demand so callers can ``idx.save("data/index.json")``
+        without first ensuring ``data/`` exists.
+        """
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": _INDEX_VERSION,
+            "documents": {
+                # JSON object keys are always strings; we cast doc_ids back
+                # to int on load. ``fields`` extents go to JSON as 2-element
+                # lists and rehydrate to tuples in ``load``.
+                str(doc.doc_id): {
+                    "url": doc.url,
+                    "fields": {name: list(extent) for name, extent in doc.fields.items()},
+                }
+                for doc in self._documents.values()
+            },
+            "vocabulary": {
+                term: [
+                    {
+                        "doc_id": posting.doc_id,
+                        "count": posting.count,
+                        "positions": list(posting.positions),
+                    }
+                    for posting in postings
+                ]
+                for term, postings in self._postings.items()
+            },
+        }
+        # ``ensure_ascii=False`` keeps the file readable for unicode tokens
+        # like ``café``; the file is written UTF-8 explicitly to match.
+        with target.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+
+    @classmethod
+    def load(cls, path: str | Path) -> InvertedIndex:
+        """Deserialise an index previously written by :meth:`save`.
+
+        Raises :class:`FileNotFoundError` if *path* doesn't exist and
+        :class:`ValueError` for any structural problem (malformed JSON,
+        missing keys, unsupported version). Refusing to limp along on a
+        corrupt index is intentional — silently producing wrong query
+        results would be worse than a clear failure at load time.
+        """
+        source = Path(path)
+        try:
+            with source.open(encoding="utf-8") as handle:
+                payload: Any = json.load(handle)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Index file {source} is not valid JSON: {exc}") from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError(f"Index file {source} must contain a JSON object")
+
+        version = payload.get("version")
+        if version != _INDEX_VERSION:
+            raise ValueError(
+                f"Index file {source} has version {version!r}; expected {_INDEX_VERSION}"
+            )
+
+        documents_raw = payload.get("documents")
+        vocabulary_raw = payload.get("vocabulary")
+        if not isinstance(documents_raw, dict) or not isinstance(vocabulary_raw, dict):
+            raise ValueError(f"Index file {source} is missing 'documents' or 'vocabulary'")
+
+        index = cls()
+        # Documents first so ``_next_id`` and ``_url_to_id`` are seeded
+        # before postings reference them. Any missing key on a document or
+        # posting record is treated as structural corruption: silently
+        # defaulting (e.g. ``fields`` -> ``{}``) would let ``field_of``
+        # return ``None`` for every hit in that document, masking the
+        # corruption rather than surfacing it.
+        try:
+            for raw_id, raw_doc in documents_raw.items():
+                doc_id = int(raw_id)
+                if not isinstance(raw_doc, dict):
+                    raise ValueError(f"document {raw_id} is not an object")
+                url = raw_doc["url"]
+                fields_obj = raw_doc["fields"]
+                if not isinstance(fields_obj, dict):
+                    raise ValueError(f"document {raw_id} 'fields' must be an object")
+                extents: dict[str, tuple[int, int]] = {}
+                for name, extent in fields_obj.items():
+                    # Reject anything that isn't a 2-element ``[start, end]``
+                    # list up front so a one-item extent raises a documented
+                    # ValueError rather than IndexError.
+                    if not isinstance(extent, list) or len(extent) != 2:
+                        raise ValueError(
+                            f"document {raw_id} field {name!r} extent must be a 2-element list"
+                        )
+                    extents[name] = (int(extent[0]), int(extent[1]))
+                # Every v1 document has both extents (see ``add_document``).
+                # A subset is structural corruption — the same kind that
+                # leads to ``field_of`` silently returning ``None``.
+                missing = {"title", "body"} - extents.keys()
+                if missing:
+                    raise ValueError(
+                        f"document {raw_id} is missing field extents: {sorted(missing)}"
+                    )
+                index._documents[doc_id] = Document(doc_id=doc_id, url=url, fields=extents)
+                index._url_to_id[url] = doc_id
+
+            if index._documents:
+                index._next_id = max(index._documents) + 1
+
+            for term, postings in vocabulary_raw.items():
+                parsed: list[Posting] = []
+                for p in postings:
+                    posting_doc_id = int(p["doc_id"])
+                    # A posting that references a doc we never loaded is
+                    # corrupt: ``lookup`` would return hits with no URL in
+                    # the catalogue, so the search layer can't display them.
+                    if posting_doc_id not in index._documents:
+                        raise ValueError(
+                            f"vocabulary entry {term!r} references unknown doc_id {posting_doc_id}"
+                        )
+                    positions = tuple(int(pos) for pos in p["positions"])
+                    count = int(p["count"])
+                    # ``count`` is meant to be cached ``len(positions)``;
+                    # disagreement is corruption that would later skew any
+                    # term-frequency computation built on top of postings.
+                    if count != len(positions):
+                        raise ValueError(
+                            f"vocabulary entry {term!r} for doc_id "
+                            f"{posting_doc_id} has count {count} but "
+                            f"{len(positions)} positions"
+                        )
+                    parsed.append(Posting(doc_id=posting_doc_id, count=count, positions=positions))
+                index._postings[term] = parsed
+        except (KeyError, TypeError, AttributeError, IndexError) as exc:
+            raise ValueError(f"Index file {source} is structurally invalid: {exc}") from exc
+
+        return index

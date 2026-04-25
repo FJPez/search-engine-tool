@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from src.indexer import Document, InvertedIndex, Posting, extract_fields, tokenise
@@ -259,3 +262,312 @@ def test_apostrophe_stripping_applied_during_indexing() -> None:
     idx.add_document("http://p/", _html(body="I can't see why"))
     assert idx.lookup("cant")[0].count == 1
     assert idx.lookup("can't") == []
+
+
+# --------------------------------------------------------------------------
+# InvertedIndex.save / load
+# --------------------------------------------------------------------------
+
+
+def _populated_index() -> InvertedIndex:
+    """Small index used by several persistence tests."""
+    idx = InvertedIndex()
+    idx.add_document(
+        "http://quotes.toscrape.com/",
+        _html(title="Quotes to Scrape", body="The world as we have created it"),
+    )
+    idx.add_document(
+        "http://quotes.toscrape.com/page/2",
+        _html(title="Page Two", body="Two roads diverged in a wood"),
+    )
+    return idx
+
+
+def test_save_round_trips_through_load(tmp_path: Path) -> None:
+    original = _populated_index()
+    target = tmp_path / "index.json"
+    original.save(target)
+    restored = InvertedIndex.load(target)
+
+    assert len(restored) == len(original)
+    assert restored.documents == original.documents
+    # Every term that existed before exists after, with identical postings
+    for term, postings in original._postings.items():
+        assert restored.lookup(term) == postings
+
+
+def test_save_creates_parent_directories(tmp_path: Path) -> None:
+    target = tmp_path / "nested" / "subdir" / "index.json"
+    _populated_index().save(target)
+    assert target.exists()
+
+
+def test_save_writes_valid_json_with_expected_top_level_shape(tmp_path: Path) -> None:
+    target = tmp_path / "index.json"
+    _populated_index().save(target)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert set(payload) == {"version", "documents", "vocabulary"}
+    # Doc keys serialise as strings; URL is stored on each document
+    assert "0" in payload["documents"]
+    assert payload["documents"]["0"]["url"] == "http://quotes.toscrape.com/"
+
+
+def test_save_preserves_unicode_tokens_unescaped(tmp_path: Path) -> None:
+    idx = InvertedIndex()
+    idx.add_document("http://p/", _html(body="café naïve"))
+    target = tmp_path / "index.json"
+    idx.save(target)
+    raw = target.read_text(encoding="utf-8")
+    # ensure_ascii=False keeps the file legible for human inspection
+    assert "café" in raw
+    assert "naïve" in raw
+
+
+def test_empty_index_round_trips(tmp_path: Path) -> None:
+    target = tmp_path / "empty.json"
+    InvertedIndex().save(target)
+    restored = InvertedIndex.load(target)
+    assert len(restored) == 0
+    assert restored.lookup("anything") == []
+
+
+def test_load_continues_assigning_doc_ids_after_restore(tmp_path: Path) -> None:
+    original = _populated_index()  # doc_ids 0, 1
+    target = tmp_path / "index.json"
+    original.save(target)
+    restored = InvertedIndex.load(target)
+    new_id = restored.add_document("http://quotes.toscrape.com/page/3", _html(body="x"))
+    assert new_id == 2
+    assert len(restored) == 3
+
+
+def test_load_idempotency_check_survives_round_trip(tmp_path: Path) -> None:
+    original = _populated_index()
+    target = tmp_path / "index.json"
+    original.save(target)
+    restored = InvertedIndex.load(target)
+    # Re-adding a URL that was in the saved file must hit the idempotency
+    # path — the URL→id map needs to be rebuilt during load.
+    same_id = restored.add_document("http://quotes.toscrape.com/", _html(body="ignored"))
+    assert same_id == 0
+    assert len(restored) == 2
+
+
+def test_load_missing_file_raises_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        InvertedIndex.load(tmp_path / "does_not_exist.json")
+
+
+def test_load_malformed_json_raises_value_error(tmp_path: Path) -> None:
+    target = tmp_path / "bad.json"
+    target.write_text("this is not json {", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        InvertedIndex.load(target)
+
+
+def test_load_version_mismatch_raises_value_error(tmp_path: Path) -> None:
+    target = tmp_path / "old.json"
+    target.write_text(
+        json.dumps({"version": 999, "documents": {}, "vocabulary": {}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="version"):
+        InvertedIndex.load(target)
+
+
+def test_load_missing_required_keys_raises_value_error(tmp_path: Path) -> None:
+    target = tmp_path / "incomplete.json"
+    target.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    with pytest.raises(ValueError, match="documents"):
+        InvertedIndex.load(target)
+
+
+def test_load_non_object_payload_raises_value_error(tmp_path: Path) -> None:
+    target = tmp_path / "list.json"
+    target.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        InvertedIndex.load(target)
+
+
+def test_load_document_missing_fields_raises_value_error(tmp_path: Path) -> None:
+    # save() always writes 'fields'; an entry without it is corrupt.
+    # Defaulting to {} would silently make field_of() return None for
+    # every position in that document — exactly the kind of misread
+    # the version field is meant to prevent.
+    target = tmp_path / "no_fields.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"url": "http://p/"}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="structurally invalid"):
+        InvertedIndex.load(target)
+
+
+def test_load_document_missing_url_raises_value_error(tmp_path: Path) -> None:
+    target = tmp_path / "no_url.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"fields": {"title": [0, 0], "body": [0, 0]}}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="structurally invalid"):
+        InvertedIndex.load(target)
+
+
+def test_load_document_with_empty_fields_raises_value_error(tmp_path: Path) -> None:
+    # ``fields: {}`` would default field_of() to None for every hit.
+    # That's the exact same silent-corruption hole the version field is
+    # meant to close, so reject it explicitly.
+    target = tmp_path / "empty_fields.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"url": "http://p/", "fields": {}}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing field extents"):
+        InvertedIndex.load(target)
+
+
+def test_load_document_with_partial_fields_raises_value_error(tmp_path: Path) -> None:
+    # Only 'title', no 'body' — same corruption as the empty case but
+    # subtler. Exercise the "missing one of two" path explicitly.
+    target = tmp_path / "partial_fields.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"url": "http://p/", "fields": {"title": [0, 0]}}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing field extents"):
+        InvertedIndex.load(target)
+
+
+def test_load_fields_not_an_object_raises_value_error(tmp_path: Path) -> None:
+    # ``"fields": []`` would call ``.items()`` on a list and raise
+    # AttributeError; the contract says structural problems are ValueError.
+    target = tmp_path / "fields_list.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"url": "http://p/", "fields": []}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="'fields' must be an object"):
+        InvertedIndex.load(target)
+
+
+def test_load_extent_wrong_length_raises_value_error(tmp_path: Path) -> None:
+    # A one-item extent would IndexError on ``extent[1]``; reject with a
+    # ValueError that names the offending field.
+    target = tmp_path / "short_extent.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"url": "http://p/", "fields": {"title": [0], "body": [0, 1]}}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="2-element list"):
+        InvertedIndex.load(target)
+
+
+def test_load_extent_not_a_list_raises_value_error(tmp_path: Path) -> None:
+    # A non-list extent (e.g. a single int) should also be rejected with
+    # the same ValueError path, not propagate a TypeError.
+    target = tmp_path / "scalar_extent.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {"0": {"url": "http://p/", "fields": {"title": 0, "body": [0, 1]}}},
+                "vocabulary": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="2-element list"):
+        InvertedIndex.load(target)
+
+
+def test_load_posting_count_mismatch_raises_value_error(tmp_path: Path) -> None:
+    # ``count`` is the cached length of ``positions``; mismatched values
+    # would skew any future term-frequency / ranking calculation.
+    target = tmp_path / "bad_count.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {
+                    "0": {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
+                },
+                "vocabulary": {"hello": [{"doc_id": 0, "count": 99, "positions": [0]}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="count 99 but 1 positions"):
+        InvertedIndex.load(target)
+
+
+def test_load_orphan_posting_raises_value_error(tmp_path: Path) -> None:
+    # Vocabulary references doc_id 0 but documents is empty — lookup()
+    # would return hits whose URL can't be resolved in the catalogue.
+    target = tmp_path / "orphan.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {},
+                "vocabulary": {"hello": [{"doc_id": 0, "count": 1, "positions": [0]}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown doc_id"):
+        InvertedIndex.load(target)
+
+
+def test_load_posting_missing_keys_raises_value_error(tmp_path: Path) -> None:
+    target = tmp_path / "bad_posting.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {
+                    "0": {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
+                },
+                "vocabulary": {"hello": [{"doc_id": 0, "count": 1}]},  # missing positions
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="structurally invalid"):
+        InvertedIndex.load(target)
