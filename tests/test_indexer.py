@@ -14,6 +14,7 @@ from src.indexer import (
     extract_fields,
     tokenise,
 )
+from tests.conftest import SingleDocIndexFactory
 
 
 def _html(title: str = "", body: str = "") -> str:
@@ -164,9 +165,10 @@ def test_add_document_is_idempotent_on_url() -> None:
     assert idx.lookup("something") == []
 
 
-def test_lookup_counts_and_positions_for_single_document() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(title="T", body="good good friends"))
+def test_lookup_counts_and_positions_for_single_document(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
+    idx = single_doc_index(title="T", body="good good friends")
     # Stream: [T, good, good, friends] -> positions 0, 1, 2, 3
     good = idx.lookup("good")
     assert good == [Posting(doc_id=0, count=2, positions=(1, 2))]
@@ -185,37 +187,34 @@ def test_lookup_aggregates_across_documents() -> None:
     assert good[1].count == 1
 
 
-def test_lookup_is_case_insensitive_on_query() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="Hello World"))
+def test_lookup_is_case_insensitive_on_query(single_doc_index: SingleDocIndexFactory) -> None:
+    idx = single_doc_index(body="Hello World")
     assert idx.lookup("HELLO") == idx.lookup("hello")
     assert idx.lookup("Hello")[0].count == 1
 
 
-def test_lookup_unknown_word_returns_empty_list() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="only this word"))
+def test_lookup_unknown_word_returns_empty_list(single_doc_index: SingleDocIndexFactory) -> None:
+    idx = single_doc_index(body="only this word")
     assert idx.lookup("absent") == []
 
 
-def test_contains_is_case_insensitive() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="Indifference"))
+def test_contains_is_case_insensitive(single_doc_index: SingleDocIndexFactory) -> None:
+    idx = single_doc_index(body="Indifference")
     assert "indifference" in idx
     assert "INDIFFERENCE" in idx
     assert "missing" not in idx
 
 
-def test_field_extents_mark_title_before_body() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(title="alpha beta", body="gamma delta"))
+def test_field_extents_mark_title_before_body(single_doc_index: SingleDocIndexFactory) -> None:
+    idx = single_doc_index(title="alpha beta", body="gamma delta")
     doc = idx.documents[0]
     assert doc.fields == {"title": (0, 2), "body": (2, 4)}
 
 
-def test_field_of_resolves_title_and_body_positions() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(title="alpha beta", body="gamma"))
+def test_field_of_resolves_title_and_body_positions(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
+    idx = single_doc_index(title="alpha beta", body="gamma")
     # Positions 0-1 are title, 2 is body
     assert idx.field_of(0, 0) == "title"
     assert idx.field_of(0, 1) == "title"
@@ -226,9 +225,10 @@ def test_field_of_resolves_title_and_body_positions() -> None:
     assert idx.field_of(999, 0) is None
 
 
-def test_field_of_reports_title_when_term_appears_in_title() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(title="unique headline", body="filler words"))
+def test_field_of_reports_title_when_term_appears_in_title(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
+    idx = single_doc_index(title="unique headline", body="filler words")
     posting = idx.lookup("unique")[0]
     assert idx.field_of(posting.doc_id, posting.positions[0]) == "title"
 
@@ -245,18 +245,20 @@ def test_empty_document_tokenises_to_no_postings() -> None:
     assert idx.field_of(0, 0) is None
 
 
-def test_unicode_tokens_round_trip_through_the_index() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="café naïve"))
+def test_unicode_tokens_round_trip_through_the_index(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
+    idx = single_doc_index(body="café naïve")
     assert idx.lookup("café")[0].count == 1
     assert idx.lookup("naïve")[0].count == 1
 
 
-def test_apostrophe_stripping_applied_during_indexing() -> None:
+def test_apostrophe_stripping_applied_during_indexing(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
     # Query must use the post-tokenisation form (same rule search.py will
     # follow): "can't" tokenises to ["cant"], so that's what we look up.
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="I can't see why"))
+    idx = single_doc_index(body="I can't see why")
     assert idx.lookup("cant")[0].count == 1
     assert idx.lookup("can't") == []
 
@@ -310,9 +312,10 @@ def test_save_writes_valid_json_with_expected_top_level_shape(tmp_path: Path) ->
     assert payload["documents"]["0"]["url"] == "http://quotes.toscrape.com/"
 
 
-def test_save_preserves_unicode_tokens_unescaped(tmp_path: Path) -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="café naïve"))
+def test_save_preserves_unicode_tokens_unescaped(
+    tmp_path: Path, single_doc_index: SingleDocIndexFactory
+) -> None:
+    idx = single_doc_index(body="café naïve")
     target = tmp_path / "index.json"
     idx.save(target)
     raw = target.read_text(encoding="utf-8")
