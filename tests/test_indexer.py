@@ -174,7 +174,7 @@ def test_lookup_counts_and_positions_for_single_document() -> None:
     assert idx.lookup("t") == [Posting(doc_id=0, count=1, positions=(0,))]
 
 
-def test_lookup_aggregates_across_documents_sorted_by_doc_id() -> None:
+def test_lookup_aggregates_across_documents() -> None:
     idx = InvertedIndex()
     idx.add_document("http://a/", _html(body="good good"))
     idx.add_document("http://b/", _html(body="bad"))
@@ -240,6 +240,9 @@ def test_empty_document_tokenises_to_no_postings() -> None:
     assert len(idx) == 1
     # Empty title + empty body => both extents collapse to (0, 0)
     assert idx.documents[0].fields == {"title": (0, 0), "body": (0, 0)}
+    # Both extents are (0, 0); position 0 satisfies start <= 0 < end
+    # for neither, so field_of correctly reports None.
+    assert idx.field_of(0, 0) is None
 
 
 def test_unicode_tokens_round_trip_through_the_index() -> None:
@@ -353,197 +356,133 @@ def test_load_missing_file_raises_file_not_found(tmp_path: Path) -> None:
         InvertedIndex.load(tmp_path / "does_not_exist.json")
 
 
-def test_load_malformed_json_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "bad.json"
-    target.write_text("this is not json {", encoding="utf-8")
-    with pytest.raises(ValueError, match="not valid JSON"):
-        InvertedIndex.load(target)
+# --------------------------------------------------------------------------
+# Corruption rejection
+#
+# Every reachable structural failure mode of an on-disk index file. Each
+# case raises ``ValueError`` (the contract on ``load``); the ``match=``
+# fragment pins which branch was taken so a regression in any one path
+# fails loud and specific.
+# --------------------------------------------------------------------------
 
 
-def test_load_version_mismatch_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "old.json"
-    target.write_text(
-        json.dumps({"version": 999, "documents": {}, "vocabulary": {}}),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="version"):
-        InvertedIndex.load(target)
+_DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
 
 
-def test_load_missing_required_keys_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "incomplete.json"
-    target.write_text(json.dumps({"version": 1}), encoding="utf-8")
-    with pytest.raises(ValueError, match="documents"):
-        InvertedIndex.load(target)
-
-
-def test_load_non_object_payload_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "list.json"
-    target.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
-    with pytest.raises(ValueError, match="JSON object"):
-        InvertedIndex.load(target)
-
-
-def test_load_document_missing_fields_raises_value_error(tmp_path: Path) -> None:
-    # save() always writes 'fields'; an entry without it is corrupt.
-    # Defaulting to {} would silently make field_of() return None for
-    # every position in that document — exactly the kind of misread
-    # the version field is meant to prevent.
-    target = tmp_path / "no_fields.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"url": "http://p/"}},
-                "vocabulary": {},
-            }
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        pytest.param("this is not json {", "not valid JSON", id="malformed-json"),
+        pytest.param(json.dumps([1, 2, 3]), "JSON object", id="non-object-payload"),
+        pytest.param(json.dumps({"version": 1}), "documents", id="missing-top-level-keys"),
+        pytest.param(
+            json.dumps({"version": 999, "documents": {}, "vocabulary": {}}),
+            "version",
+            id="version-mismatch",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="structurally invalid"):
-        InvertedIndex.load(target)
-
-
-def test_load_document_missing_url_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "no_url.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"fields": {"title": [0, 0], "body": [0, 0]}}},
-                "vocabulary": {},
-            }
+        pytest.param(
+            json.dumps({"version": 1, "documents": {"0": {"url": "http://p/"}}, "vocabulary": {}}),
+            "structurally invalid",
+            id="document-missing-fields",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="structurally invalid"):
-        InvertedIndex.load(target)
-
-
-def test_load_document_with_empty_fields_raises_value_error(tmp_path: Path) -> None:
-    # ``fields: {}`` would default field_of() to None for every hit.
-    # That's the exact same silent-corruption hole the version field is
-    # meant to close, so reject it explicitly.
-    target = tmp_path / "empty_fields.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"url": "http://p/", "fields": {}}},
-                "vocabulary": {},
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {"0": {"fields": {"title": [0, 0], "body": [0, 0]}}},
+                    "vocabulary": {},
+                }
+            ),
+            "structurally invalid",
+            id="document-missing-url",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="missing field extents"):
-        InvertedIndex.load(target)
-
-
-def test_load_document_with_partial_fields_raises_value_error(tmp_path: Path) -> None:
-    # Only 'title', no 'body' — same corruption as the empty case but
-    # subtler. Exercise the "missing one of two" path explicitly.
-    target = tmp_path / "partial_fields.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"url": "http://p/", "fields": {"title": [0, 0]}}},
-                "vocabulary": {},
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {"0": {"url": "http://p/", "fields": {}}},
+                    "vocabulary": {},
+                }
+            ),
+            "missing field extents",
+            id="document-empty-fields",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="missing field extents"):
-        InvertedIndex.load(target)
-
-
-def test_load_fields_not_an_object_raises_value_error(tmp_path: Path) -> None:
-    # ``"fields": []`` would call ``.items()`` on a list and raise
-    # AttributeError; the contract says structural problems are ValueError.
-    target = tmp_path / "fields_list.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"url": "http://p/", "fields": []}},
-                "vocabulary": {},
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {"0": {"url": "http://p/", "fields": {"title": [0, 0]}}},
+                    "vocabulary": {},
+                }
+            ),
+            "missing field extents",
+            id="document-partial-fields",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="'fields' must be an object"):
-        InvertedIndex.load(target)
-
-
-def test_load_extent_wrong_length_raises_value_error(tmp_path: Path) -> None:
-    # A one-item extent would IndexError on ``extent[1]``; reject with a
-    # ValueError that names the offending field.
-    target = tmp_path / "short_extent.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"url": "http://p/", "fields": {"title": [0], "body": [0, 1]}}},
-                "vocabulary": {},
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {"0": {"url": "http://p/", "fields": []}},
+                    "vocabulary": {},
+                }
+            ),
+            "structurally invalid",
+            id="fields-not-an-object",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="2-element list"):
-        InvertedIndex.load(target)
-
-
-def test_load_extent_not_a_list_raises_value_error(tmp_path: Path) -> None:
-    # A non-list extent (e.g. a single int) should also be rejected with
-    # the same ValueError path, not propagate a TypeError.
-    target = tmp_path / "scalar_extent.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {"0": {"url": "http://p/", "fields": {"title": 0, "body": [0, 1]}}},
-                "vocabulary": {},
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {
+                        "0": {"url": "http://p/", "fields": {"title": [0], "body": [0, 1]}}
+                    },
+                    "vocabulary": {},
+                }
+            ),
+            "structurally invalid",
+            id="extent-wrong-length",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="2-element list"):
-        InvertedIndex.load(target)
-
-
-def test_load_orphan_posting_raises_value_error(tmp_path: Path) -> None:
-    # Vocabulary references doc_id 0 but documents is empty — lookup()
-    # would return hits whose URL can't be resolved in the catalogue.
-    target = tmp_path / "orphan.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {},
-                "vocabulary": {"hello": [{"doc_id": 0, "positions": [0]}]},
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {
+                        "0": {"url": "http://p/", "fields": {"title": 0, "body": [0, 1]}}
+                    },
+                    "vocabulary": {},
+                }
+            ),
+            "structurally invalid",
+            id="extent-not-a-list",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="unknown doc_id"):
-        InvertedIndex.load(target)
-
-
-def test_load_posting_missing_keys_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "bad_posting.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {
-                    "0": {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
-                },
-                "vocabulary": {"hello": [{"doc_id": 0}]},  # missing positions
-            }
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {},
+                    "vocabulary": {"hello": [{"doc_id": 0, "positions": [0]}]},
+                }
+            ),
+            "unknown doc_id",
+            id="orphan-posting",
         ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="structurally invalid"):
+        pytest.param(
+            json.dumps(
+                {
+                    "version": 1,
+                    "documents": {"0": _DOC_OK},
+                    "vocabulary": {"hello": [{"doc_id": 0}]},
+                }
+            ),
+            "structurally invalid",
+            id="posting-missing-keys",
+        ),
+    ],
+)
+def test_load_rejects_corrupt_payload(tmp_path: Path, raw: str, match: str) -> None:
+    target = tmp_path / "corrupt.json"
+    target.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
         InvertedIndex.load(target)
 
 

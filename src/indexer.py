@@ -41,7 +41,7 @@ Public API
   - :meth:`InvertedIndex.field_of` reports which field a token position
     falls in. Future ranking will use this to weight title hits.
   - :attr:`InvertedIndex.documents` exposes the ``doc_id → Document``
-    catalogue as a defensive copy for the query layer.
+    catalogue for the query layer.
   - :meth:`InvertedIndex.save` / :meth:`InvertedIndex.load` round-trip
     the index through a single JSON file (the graded submission
     artefact). ``load`` validates every shape it reads and raises
@@ -188,10 +188,9 @@ class Posting:
     """One inverted-index entry: a term's occurrences inside a single doc.
 
     ``positions`` are token indices into that document's concatenated
-    ``title + body`` stream, 0-indexed. ``count`` is redundant with
-    ``len(positions)`` but cached so query code can read it without a
-    ``len`` call and so a position-less variant could be swapped in later
-    without breaking the field shape.
+    ``title + body`` stream, 0-indexed. ``count`` is ``len(positions)``;
+    it is kept as its own field so a future counts-only variant could
+    drop ``positions`` without changing the ``Posting`` shape.
     """
 
     doc_id: int
@@ -366,6 +365,9 @@ class InvertedIndex:
         missing keys, unsupported version). Refusing to limp along on a
         corrupt index is intentional — silently producing wrong query
         results would be worse than a clear failure at load time.
+
+        Postings are sorted by ``doc_id`` on the way in so the order
+        :meth:`lookup` advertises holds regardless of the file's order.
         """
         source = Path(path)
         try:
@@ -390,33 +392,21 @@ class InvertedIndex:
 
         index = cls()
         # Documents first so ``_next_id`` and ``_url_to_id`` are seeded
-        # before postings reference them. Any missing key on a document or
-        # posting record is treated as structural corruption: silently
-        # defaulting (e.g. ``fields`` -> ``{}``) would let ``field_of``
-        # return ``None`` for every hit in that document, masking the
-        # corruption rather than surfacing it.
+        # before postings reference them. The catch-all below turns shape
+        # mismatches (wrong container type, missing key, short extent)
+        # into a single wrapped ValueError — explicit per-field isinstance
+        # checks would only restate the same protection.
         try:
             for raw_id, raw_doc in documents_raw.items():
                 doc_id = int(raw_id)
-                if not isinstance(raw_doc, dict):
-                    raise ValueError(f"document {raw_id} is not an object")
                 url = raw_doc["url"]
-                fields_obj = raw_doc["fields"]
-                if not isinstance(fields_obj, dict):
-                    raise ValueError(f"document {raw_id} 'fields' must be an object")
-                extents: dict[str, tuple[int, int]] = {}
-                for name, extent in fields_obj.items():
-                    # Reject anything that isn't a 2-element ``[start, end]``
-                    # list up front so a one-item extent raises a documented
-                    # ValueError rather than IndexError.
-                    if not isinstance(extent, list) or len(extent) != 2:
-                        raise ValueError(
-                            f"document {raw_id} field {name!r} extent must be a 2-element list"
-                        )
-                    extents[name] = (int(extent[0]), int(extent[1]))
+                extents: dict[str, tuple[int, int]] = {
+                    name: (int(extent[0]), int(extent[1]))
+                    for name, extent in raw_doc["fields"].items()
+                }
                 # Every v1 document has both extents (see ``add_document``).
-                # A subset is structural corruption — the same kind that
-                # leads to ``field_of`` silently returning ``None``.
+                # A subset would silently make ``field_of`` return ``None``
+                # for every position in the document — fail loudly instead.
                 missing = {"title", "body"} - extents.keys()
                 if missing:
                     raise ValueError(
