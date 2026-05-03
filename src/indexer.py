@@ -1,14 +1,103 @@
 """Inverted-index construction for the COMP3011 search-engine-tool.
 
-This module consumes the crawler's ``(canonical_url, raw_html)`` stream and
-produces an on-disk inverted index. Tokenisation, field extraction and the
-index data structure all live here so that future changes to parsing never
-require a re-crawl.
+The module consumes the crawler's ``(canonical_url, raw_html)`` stream and
+produces an in-memory inverted index that can be persisted to a single JSON
+file. Every parsing decision — what counts as a token, how titles and bodies
+are separated, where positions are recorded — lives here, so future indexer
+changes never force a re-crawl.
 
-Public API: :func:`tokenise`, :func:`extract_fields`, :class:`Posting`,
-:class:`Document`, and :class:`InvertedIndex` with the alternate constructors
-:meth:`InvertedIndex.load` (from disk) and :meth:`InvertedIndex.from_pages`
-(from a stream of ``(url, html)`` pairs, typically ``crawler.crawl()``).
+Public API
+----------
+
+* :func:`tokenise` — pure text → token-list. Lowercases, strips apostrophes
+  so contractions stay one token (``can't`` → ``cant``), then splits on any
+  run of non-alphanumerics. The same function is used at index time and
+  query time so the two streams round-trip identically.
+
+* :func:`extract_fields` — first pass of the two-pass tokenisation pipeline
+  (NOTES.md L11 p.6): BeautifulSoup + ``lxml`` identify markup, drop
+  ``<script>`` / ``<style>`` / ``<noscript>``, and return ``{'title', 'body'}``
+  text for the second pass to tokenise.
+
+* :class:`Posting` — one entry in a term's inverted list:
+  ``(doc_id, count, positions)`` against the document's concatenated
+  ``title + body`` token stream. ``count`` is the cached length of
+  ``positions`` (NOTES.md L12 pp.13-16).
+
+* :class:`Document` — entry in the document catalogue:
+  ``(doc_id, url, fields)`` where ``fields`` maps a field name to its
+  half-open ``(start, end)`` extent in the token stream (NOTES.md L12
+  pp.9, 17-18).
+
+* :class:`InvertedIndex` — the container.
+
+  - :meth:`InvertedIndex.add_document` ingests one ``(url, html)`` pair,
+    assigns a fresh ``doc_id``, and updates the postings. Idempotent on
+    URL so a crawler that yields a redirect-equivalent URL twice does not
+    double-count.
+  - :meth:`InvertedIndex.lookup` returns a posting list sorted by
+    ``doc_id`` ascending — the invariant the eventual two-pointer
+    intersection in ``search.py`` will rely on (NOTES.md L13 p.12).
+  - :meth:`InvertedIndex.field_of` reports which field a token position
+    falls in. Future ranking will use this to weight title hits.
+  - :attr:`InvertedIndex.documents` exposes the ``doc_id → Document``
+    catalogue as a defensive copy for the query layer.
+  - :meth:`InvertedIndex.save` / :meth:`InvertedIndex.load` round-trip
+    the index through a single JSON file (the graded submission
+    artefact). ``load`` validates every shape it reads and raises
+    :class:`ValueError` on any structural problem; silently producing
+    wrong query results would be worse than a clear failure.
+  - :meth:`InvertedIndex.from_pages` is the alternate constructor that
+    drives a full ingest from any iterable of ``(url, html)`` pairs
+    (typically ``crawler.crawl()``).
+
+Tokenizer policy
+----------------
+
+Each decision is documented at its slide source so the video walkthrough
+can cite it directly:
+
+* **Lowercase before indexing** — case-insensitive matching (brief rule;
+  NOTES.md L11 p.7).
+* **Apostrophes stripped** — ``can't`` → ``cant``. One token per
+  contraction; queries for ``cant`` match ``can't``. Avoids orphan ``t``
+  / ``s`` / ``ll`` tokens (NOTES.md L11 p.12).
+* **Hyphens / periods / abbreviations split** — falls out of the ``\\W+``
+  rule. Documented as a small, accepted cost on this corpus (NOTES.md
+  L11 pp.10, 14).
+* **Numbers kept** — meaningful per NOTES.md L11 p.13. ``92.3`` splits
+  to ``92`` / ``3`` because of the period rule above.
+* **Short tokens kept** — ``j lo``, ``el paso`` style (NOTES.md L11
+  p.9). Don't drop blindly.
+* **Stopwords kept** — removing them would break queries like
+  ``"to be or not to be"`` (NOTES.md L11 p.17).
+* **No stemming** — < 5% gain on English; Porter is a possible
+  extension to mention in the video, not v1 work (NOTES.md L11 pp.19-21).
+
+Design constraints
+------------------
+
+* **Crawler/indexer contract.** The crawler yields *raw* HTML. All HTML
+  parsing decisions (which tags carry text, where the title ends) live
+  here. Tokenisation never runs over the wire.
+
+* **Postings reference doc_ids, not URLs** (NOTES.md L12 p.9). Inverted
+  lists stay compact and the document catalogue is the single source of
+  truth for ``doc_id → URL``.
+
+* **Field extents on the Document, not the Posting** (NOTES.md L12
+  pp.17-18). One ``(start, end)`` pair per field per document, instead
+  of a flag on every occurrence; positions stay a single flat list.
+
+* **Raw counts and positions are stored — not pre-computed scores**
+  (NOTES.md L12 p.20). Whatever ranking we ever add, it can be computed
+  from the index without rebuilding it.
+
+* **Single JSON file on disk** (NOTES.md L12 pp.21-25). One inverted
+  file plus an in-memory vocabulary lookup; explicitly *not* one file
+  per term. JSON over pickle: the index is a graded submission
+  artefact, ``json.load`` is safe on untrusted input, and ``café``
+  survives the round-trip thanks to ``ensure_ascii=False``.
 """
 
 from __future__ import annotations
