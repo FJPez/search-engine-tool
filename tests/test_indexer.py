@@ -14,13 +14,7 @@ from src.indexer import (
     extract_fields,
     tokenise,
 )
-from tests.conftest import SingleDocIndexFactory
-
-
-def _html(title: str = "", body: str = "") -> str:
-    """Build a minimal HTML document with optional title and body."""
-    title_tag = f"<title>{title}</title>" if title else ""
-    return f"<!doctype html><html><head>{title_tag}</head><body>{body}</body></html>"
+from tests.conftest import HtmlFactory, SingleDocIndexFactory
 
 
 @pytest.mark.parametrize(
@@ -85,36 +79,36 @@ def test_tokenise_is_idempotent_on_its_own_output() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_extract_fields_title_and_body() -> None:
-    result = extract_fields(_html(title="Quotes to Scrape", body="<p>Hello world</p>"))
+def test_extract_fields_title_and_body(html: HtmlFactory) -> None:
+    result = extract_fields(html(title="Quotes to Scrape", body="<p>Hello world</p>"))
     assert result["title"] == "Quotes to Scrape"
     assert "Hello world" in result["body"]
     # Title is not duplicated into the body stream
     assert "Quotes to Scrape" not in result["body"]
 
 
-def test_extract_fields_missing_title_is_empty_string() -> None:
-    result = extract_fields(_html(body="<p>no title here</p>"))
+def test_extract_fields_missing_title_is_empty_string(html: HtmlFactory) -> None:
+    result = extract_fields(html(body="<p>no title here</p>"))
     assert result["title"] == ""
     assert "no title here" in result["body"]
 
 
-def test_extract_fields_strips_script_and_style_and_noscript() -> None:
+def test_extract_fields_strips_script_and_style_and_noscript(html: HtmlFactory) -> None:
     body = (
         "<script>var secret='indexthis';</script>"
         "<style>.a { content: 'cssleak'; }</style>"
         "<noscript>enable javascript</noscript>"
         "<p>real content</p>"
     )
-    result = extract_fields(_html(title="T", body=body))
+    result = extract_fields(html(title="T", body=body))
     assert "real content" in result["body"]
     for leaked in ("secret", "indexthis", "cssleak", "enable javascript"):
         assert leaked not in result["body"]
 
 
-def test_extract_fields_flattens_nested_inline_tags() -> None:
+def test_extract_fields_flattens_nested_inline_tags(html: HtmlFactory) -> None:
     # Adjacent inline tags must not glue into a single word
-    result = extract_fields(_html(body="<p>hello <b>world</b></p>"))
+    result = extract_fields(html(body="<p>hello <b>world</b></p>"))
     body_tokens = tokenise(result["body"])
     assert body_tokens == ["hello", "world"]
 
@@ -131,9 +125,9 @@ def test_extract_fields_empty_input() -> None:
     assert result == {"title": "", "body": ""}
 
 
-def test_extract_fields_whitespace_only_title_is_empty() -> None:
+def test_extract_fields_whitespace_only_title_is_empty(html: HtmlFactory) -> None:
     # <title>   </title> should not leak whitespace into the title field
-    result = extract_fields(_html(title="   ", body="content"))
+    result = extract_fields(html(title="   ", body="content"))
     assert result["title"] == ""
 
 
@@ -142,18 +136,18 @@ def test_extract_fields_whitespace_only_title_is_empty() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_add_document_returns_sequential_doc_ids() -> None:
+def test_add_document_returns_sequential_doc_ids(html: HtmlFactory) -> None:
     idx = InvertedIndex()
-    assert idx.add_document("http://a/", _html(body="alpha")) == 0
-    assert idx.add_document("http://b/", _html(body="beta")) == 1
-    assert idx.add_document("http://c/", _html(body="gamma")) == 2
+    assert idx.add_document("http://a/", html(body="alpha")) == 0
+    assert idx.add_document("http://b/", html(body="beta")) == 1
+    assert idx.add_document("http://c/", html(body="gamma")) == 2
     assert len(idx) == 3
 
 
-def test_add_document_is_idempotent_on_url() -> None:
+def test_add_document_is_idempotent_on_url(html: HtmlFactory) -> None:
     idx = InvertedIndex()
-    first = idx.add_document("http://dup/", _html(body="hello world"))
-    second = idx.add_document("http://dup/", _html(body="something else entirely"))
+    first = idx.add_document("http://dup/", html(body="hello world"))
+    second = idx.add_document("http://dup/", html(body="something else entirely"))
     assert first == second
     assert len(idx) == 1
     # The second call must not re-tokenise: posting list for "hello" should
@@ -176,11 +170,11 @@ def test_lookup_counts_and_positions_for_single_document(
     assert idx.lookup("t") == [Posting(doc_id=0, count=1, positions=(0,))]
 
 
-def test_lookup_aggregates_across_documents() -> None:
+def test_lookup_aggregates_across_documents(html: HtmlFactory) -> None:
     idx = InvertedIndex()
-    idx.add_document("http://a/", _html(body="good good"))
-    idx.add_document("http://b/", _html(body="bad"))
-    idx.add_document("http://c/", _html(body="good"))
+    idx.add_document("http://a/", html(body="good good"))
+    idx.add_document("http://b/", html(body="bad"))
+    idx.add_document("http://c/", html(body="good"))
     good = idx.lookup("good")
     assert [p.doc_id for p in good] == [0, 2]
     assert good[0].count == 2
@@ -233,9 +227,9 @@ def test_field_of_reports_title_when_term_appears_in_title(
     assert idx.field_of(posting.doc_id, posting.positions[0]) == "title"
 
 
-def test_empty_document_tokenises_to_no_postings() -> None:
+def test_empty_document_tokenises_to_no_postings(html: HtmlFactory) -> None:
     idx = InvertedIndex()
-    doc_id = idx.add_document("http://empty/", _html())
+    doc_id = idx.add_document("http://empty/", html())
     assert doc_id == 0
     assert len(idx) == 1
     # Empty title + empty body => both extents collapse to (0, 0)
@@ -268,22 +262,23 @@ def test_apostrophe_stripping_applied_during_indexing(
 # --------------------------------------------------------------------------
 
 
-def _populated_index() -> InvertedIndex:
-    """Small index used by several persistence tests."""
+@pytest.fixture
+def populated_index(html: HtmlFactory) -> InvertedIndex:
+    """Small two-doc index used by several persistence tests."""
     idx = InvertedIndex()
     idx.add_document(
         "http://quotes.toscrape.com/",
-        _html(title="Quotes to Scrape", body="The world as we have created it"),
+        html(title="Quotes to Scrape", body="The world as we have created it"),
     )
     idx.add_document(
         "http://quotes.toscrape.com/page/2",
-        _html(title="Page Two", body="Two roads diverged in a wood"),
+        html(title="Page Two", body="Two roads diverged in a wood"),
     )
     return idx
 
 
-def test_save_round_trips_through_load(tmp_path: Path) -> None:
-    original = _populated_index()
+def test_save_round_trips_through_load(tmp_path: Path, populated_index: InvertedIndex) -> None:
+    original = populated_index
     target = tmp_path / "index.json"
     original.save(target)
     restored = InvertedIndex.load(target)
@@ -295,15 +290,17 @@ def test_save_round_trips_through_load(tmp_path: Path) -> None:
         assert restored.lookup(term) == postings
 
 
-def test_save_creates_parent_directories(tmp_path: Path) -> None:
+def test_save_creates_parent_directories(tmp_path: Path, populated_index: InvertedIndex) -> None:
     target = tmp_path / "nested" / "subdir" / "index.json"
-    _populated_index().save(target)
+    populated_index.save(target)
     assert target.exists()
 
 
-def test_save_writes_valid_json_with_expected_top_level_shape(tmp_path: Path) -> None:
+def test_save_writes_valid_json_with_expected_top_level_shape(
+    tmp_path: Path, populated_index: InvertedIndex
+) -> None:
     target = tmp_path / "index.json"
-    _populated_index().save(target)
+    populated_index.save(target)
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["version"] == 1
     assert set(payload) == {"version", "documents", "vocabulary"}
@@ -332,24 +329,28 @@ def test_empty_index_round_trips(tmp_path: Path) -> None:
     assert restored.lookup("anything") == []
 
 
-def test_load_continues_assigning_doc_ids_after_restore(tmp_path: Path) -> None:
-    original = _populated_index()  # doc_ids 0, 1
+def test_load_continues_assigning_doc_ids_after_restore(
+    tmp_path: Path, populated_index: InvertedIndex, html: HtmlFactory
+) -> None:
+    original = populated_index  # doc_ids 0, 1
     target = tmp_path / "index.json"
     original.save(target)
     restored = InvertedIndex.load(target)
-    new_id = restored.add_document("http://quotes.toscrape.com/page/3", _html(body="x"))
+    new_id = restored.add_document("http://quotes.toscrape.com/page/3", html(body="x"))
     assert new_id == 2
     assert len(restored) == 3
 
 
-def test_load_idempotency_check_survives_round_trip(tmp_path: Path) -> None:
-    original = _populated_index()
+def test_load_idempotency_check_survives_round_trip(
+    tmp_path: Path, populated_index: InvertedIndex, html: HtmlFactory
+) -> None:
+    original = populated_index
     target = tmp_path / "index.json"
     original.save(target)
     restored = InvertedIndex.load(target)
     # Re-adding a URL that was in the saved file must hit the idempotency
     # path — the URL→id map needs to be rebuilt during load.
-    same_id = restored.add_document("http://quotes.toscrape.com/", _html(body="ignored"))
+    same_id = restored.add_document("http://quotes.toscrape.com/", html(body="ignored"))
     assert same_id == 0
     assert len(restored) == 2
 
@@ -520,11 +521,11 @@ def test_load_sorts_postings_by_doc_id(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_from_pages_indexes_every_page() -> None:
+def test_from_pages_indexes_every_page(html: HtmlFactory) -> None:
     pages = [
-        ("http://q/1", _html(title="One", body="alpha beta")),
-        ("http://q/2", _html(title="Two", body="alpha gamma")),
-        ("http://q/3", _html(title="Three", body="delta")),
+        ("http://q/1", html(title="One", body="alpha beta")),
+        ("http://q/2", html(title="Two", body="alpha gamma")),
+        ("http://q/3", html(title="Three", body="delta")),
     ]
     index = InvertedIndex.from_pages(pages)
 
@@ -548,13 +549,13 @@ def test_from_pages_handles_empty_input() -> None:
     assert index.lookup("anything") == []
 
 
-def test_from_pages_accepts_a_lazy_iterator() -> None:
+def test_from_pages_accepts_a_lazy_iterator(html: HtmlFactory) -> None:
     # Passing a generator ensures we don't accidentally rely on len() or
     # multi-pass iteration — the realistic caller is crawler.crawl(),
     # which is itself a one-shot generator.
     def pages() -> Iterator[tuple[str, str]]:
-        yield ("http://q/1", _html(body="hello"))
-        yield ("http://q/2", _html(body="world"))
+        yield ("http://q/1", html(body="hello"))
+        yield ("http://q/2", html(body="world"))
 
     index = InvertedIndex.from_pages(pages())
     assert len(index) == 2
@@ -562,13 +563,13 @@ def test_from_pages_accepts_a_lazy_iterator() -> None:
     assert index.lookup("world")[0].doc_id == 1
 
 
-def test_from_pages_preserves_idempotency_on_duplicate_urls() -> None:
+def test_from_pages_preserves_idempotency_on_duplicate_urls(html: HtmlFactory) -> None:
     # If the underlying source ever yields the same canonical URL twice
     # (redirect edge case in the live crawler), add_document's idempotency
     # guard kicks in and keeps the index honest.
     pages = [
-        ("http://q/dup", _html(body="hello world")),
-        ("http://q/dup", _html(body="ignored second body")),
+        ("http://q/dup", html(body="hello world")),
+        ("http://q/dup", html(body="ignored second body")),
     ]
     index = InvertedIndex.from_pages(pages)
     assert len(index) == 1
