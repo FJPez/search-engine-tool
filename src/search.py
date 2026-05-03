@@ -1,7 +1,8 @@
 """Query layer over the inverted index.
 
 Public so far: :func:`find` (multi-word conjunctive lookup, the brief's
-``find`` command). :func:`print_entry` lands in a follow-up commit.
+``find`` command) and :func:`print_entry` (single-word inverted-index
+entry formatting, the brief's ``print`` command).
 """
 
 from __future__ import annotations
@@ -92,3 +93,53 @@ def find(index: InvertedIndex, query: str) -> list[str]:
 
     documents = index.documents
     return [documents[doc_id].url for doc_id in matched_doc_ids]
+
+
+def print_entry(index: InvertedIndex, word: str) -> str:
+    """Return the formatted inverted-index entry for *word*.
+
+    The brief's ``print`` command prints "the inverted index for a
+    particular word". The CLI hands this function the user's argument
+    and pipes the return value through ``print()``.
+
+    *word* is run through :func:`src.indexer.tokenise` so the case-fold
+    and apostrophe-stripping happen identically to indexing time —
+    typing ``Good`` looks up ``good``; typing ``can't`` looks up
+    ``cant``. The header line shows the canonical (tokenised) form so
+    the user can see what was actually matched.
+
+    The return shape is always a string, even for absent words — the
+    CLI can wrap the call in ``print(...)`` for both hits and misses
+    without a None-check. Format:
+
+        good (3 documents)
+          0 http://quotes.toscrape.com/        count=2  positions=[1, 7]
+          2 http://quotes.toscrape.com/page/2  count=1  positions=[3]
+
+    A word that tokenises to nothing (punctuation only, empty string)
+    falls back to ``"<word> (0 documents)"`` using the original input
+    so the user still gets a recognisable echo of what they typed.
+    """
+    tokens = tokenise(word)
+    if not tokens:
+        return f"{word} (0 documents)"
+
+    # ``print`` is documented as "for a particular word" (singular). If a
+    # caller hands us a multi-word string we look up the first token and
+    # ignore the rest — the CLI dispatcher should be using the right
+    # argument shape, but this is the defensive read.
+    term = tokens[0]
+    postings = index.lookup(term)
+
+    header = f"{term} ({len(postings)} documents)"
+    if not postings:
+        return header
+
+    documents = index.documents
+    lines = [header]
+    for posting in postings:
+        url = documents[posting.doc_id].url
+        lines.append(
+            f"  {posting.doc_id} {url}  count={posting.count}  positions={list(posting.positions)}"
+        )
+    return "\n".join(lines)

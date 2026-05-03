@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from src.indexer import InvertedIndex, Posting
-from src.search import _intersect_postings, find
-from tests.conftest import HtmlFactory
+from src.search import _intersect_postings, find, print_entry
+from tests.conftest import HtmlFactory, SingleDocIndexFactory
 
 
 def _postings(*doc_ids: int) -> list[Posting]:
@@ -197,3 +197,54 @@ def test_find_repeated_term_in_query_is_idempotent(three_doc_index: InvertedInde
     # posting list with itself gives the same list back. Behaviourally
     # equivalent to the single-term query.
     assert find(three_doc_index, "good good") == find(three_doc_index, "good")
+
+
+# --------------------------------------------------------------------------
+# print_entry
+#
+# Tokenisation, lookup ordering, and case-fold are exercised through the
+# indexer's own tests; the cases below cover only what print_entry adds:
+# the formatted string shape for hits, misses, and the punctuation-only
+# echo behaviour.
+# --------------------------------------------------------------------------
+
+
+def test_print_entry_present_word_with_multiple_postings(html: HtmlFactory) -> None:
+    # Header reports canonical term + count; one body line per posting in
+    # doc_id ascending order with all four fields rendered.
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body="good")),
+            ("http://q/2", html(body="bad")),
+            ("http://q/3", html(body="good good")),
+        ]
+    )
+    output = print_entry(idx, "good")
+    lines = output.split("\n")
+    assert lines[0] == "good (2 documents)"
+    assert "http://q/1" in lines[1]
+    assert "count=1" in lines[1]
+    assert "positions=[0]" in lines[1]
+    assert "http://q/3" in lines[2]
+    assert "count=2" in lines[2]
+    assert "positions=[0, 1]" in lines[2]
+
+
+def test_print_entry_absent_word_returns_zero_documents_line(html: HtmlFactory) -> None:
+    # A miss returns a single-line "<word> (0 documents)" string — no body
+    # lines — so the CLI's `print(print_entry(...))` works uniformly for
+    # both hits and misses without a None-check.
+    idx = InvertedIndex.from_pages([("http://q/1", html(body="hello"))])
+    output = print_entry(idx, "missing")
+    assert output == "missing (0 documents)"
+
+
+def test_print_entry_punctuation_only_input_keeps_original_in_header(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
+    # "...???" tokenises to []; there's no canonical form to show, so we
+    # echo the original input in the header. Lets the user see we received
+    # their input rather than printing something opaque.
+    idx = single_doc_index(body="content")
+    output = print_entry(idx, "...???")
+    assert output == "...??? (0 documents)"
