@@ -5,9 +5,10 @@ produces an on-disk inverted index. Tokenisation, field extraction and the
 index data structure all live here so that future changes to parsing never
 require a re-crawl.
 
-Public API so far: :func:`tokenise`, :func:`extract_fields`, :class:`Posting`,
-:class:`Document`, :class:`InvertedIndex` (with ``save`` / ``load``). The
-:func:`build_from_crawler` convenience lands in a follow-up commit.
+Public API: :func:`tokenise`, :func:`extract_fields`, :class:`Posting`,
+:class:`Document`, and :class:`InvertedIndex` with the alternate constructors
+:meth:`InvertedIndex.load` (from disk) and :meth:`InvertedIndex.from_pages`
+(from a stream of ``(url, html)`` pairs, typically ``crawler.crawl()``).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -368,4 +370,20 @@ class InvertedIndex:
         except (KeyError, TypeError, AttributeError, IndexError) as exc:
             raise ValueError(f"Index file {source} is structurally invalid: {exc}") from exc
 
+        return index
+
+    @classmethod
+    def from_pages(cls, pages: Iterable[tuple[str, str]]) -> InvertedIndex:
+        """Build a fresh index from an iterable of ``(url, html)`` pairs.
+
+        Alternate constructor that drives a full ingest in one pass. The
+        expected caller is :meth:`src.crawler.PoliteCrawler.crawl`, but the
+        signature is the looser ``Iterable[tuple[str, str]]`` so tests (and
+        any future cached or file-backed source) can supply pages directly
+        without dressing up as a crawler. The crawler owns politeness and
+        scope; the indexer owns tokenisation; this method is the seam.
+        """
+        index = cls()
+        for url, html in pages:
+            index.add_document(url, html)
         return index

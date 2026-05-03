@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from src.indexer import Document, InvertedIndex, Posting, extract_fields, tokenise
+from src.indexer import (
+    Document,
+    InvertedIndex,
+    Posting,
+    extract_fields,
+    tokenise,
+)
 
 
 def _html(title: str = "", body: str = "") -> str:
@@ -571,3 +578,64 @@ def test_load_posting_missing_keys_raises_value_error(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="structurally invalid"):
         InvertedIndex.load(target)
+
+
+# --------------------------------------------------------------------------
+# InvertedIndex.from_pages
+# --------------------------------------------------------------------------
+
+
+def test_from_pages_indexes_every_page() -> None:
+    pages = [
+        ("http://q/1", _html(title="One", body="alpha beta")),
+        ("http://q/2", _html(title="Two", body="alpha gamma")),
+        ("http://q/3", _html(title="Three", body="delta")),
+    ]
+    index = InvertedIndex.from_pages(pages)
+
+    assert len(index) == 3
+    assert {doc.url for doc in index.documents.values()} == {
+        "http://q/1",
+        "http://q/2",
+        "http://q/3",
+    }
+    # Postings aggregate across the yielded pages
+    alpha = index.lookup("alpha")
+    assert [p.doc_id for p in alpha] == [0, 1]
+    assert [p.count for p in alpha] == [1, 1]
+    # And single-page tokens still surface
+    assert index.lookup("delta")[0].doc_id == 2
+
+
+def test_from_pages_handles_empty_input() -> None:
+    index = InvertedIndex.from_pages([])
+    assert len(index) == 0
+    assert index.lookup("anything") == []
+
+
+def test_from_pages_accepts_a_lazy_iterator() -> None:
+    # Passing a generator ensures we don't accidentally rely on len() or
+    # multi-pass iteration — the realistic caller is crawler.crawl(),
+    # which is itself a one-shot generator.
+    def pages() -> Iterator[tuple[str, str]]:
+        yield ("http://q/1", _html(body="hello"))
+        yield ("http://q/2", _html(body="world"))
+
+    index = InvertedIndex.from_pages(pages())
+    assert len(index) == 2
+    assert index.lookup("hello")[0].doc_id == 0
+    assert index.lookup("world")[0].doc_id == 1
+
+
+def test_from_pages_preserves_idempotency_on_duplicate_urls() -> None:
+    # If the underlying source ever yields the same canonical URL twice
+    # (redirect edge case in the live crawler), add_document's idempotency
+    # guard kicks in and keeps the index honest.
+    pages = [
+        ("http://q/dup", _html(body="hello world")),
+        ("http://q/dup", _html(body="ignored second body")),
+    ]
+    index = InvertedIndex.from_pages(pages)
+    assert len(index) == 1
+    assert index.lookup("hello")[0].count == 1
+    assert index.lookup("ignored") == []
