@@ -1,8 +1,86 @@
 """Query layer over the inverted index.
 
-Public so far: :func:`find` (multi-word conjunctive lookup, the brief's
-``find`` command) and :func:`print_entry` (single-word inverted-index
-entry formatting, the brief's ``print`` command).
+The module powers two of the brief's four CLI commands by reading from a
+built :class:`src.indexer.InvertedIndex` — it never mutates the index and
+never touches the network. Both public functions are pure: ``find`` for
+multi-word conjunctive lookup and ``print_entry`` for single-word
+formatted output.
+
+Public API
+----------
+
+* :func:`find` — the brief's ``find <w1> [w2 ...]`` command. Tokenises
+  the query through :func:`src.indexer.tokenise` so the same case-fold
+  and apostrophe-stripping happen at query time as at indexing time
+  (so ``can't`` matches indexed ``cant`` with no caller normalisation).
+  Returns the URLs of documents containing **all** query terms, sorted
+  by ``doc_id`` ascending. Empty / whitespace / punctuation-only
+  queries return ``[]``.
+
+* :func:`print_entry` — the brief's ``print <word>`` command. Returns a
+  formatted multi-line string ready for the CLI to print. The return
+  shape is always a string (never ``None``), so the CLI can pipe both
+  hits and misses through ``print()`` without a special path.
+
+* :func:`_intersect_postings` — module-private helper that powers
+  :func:`find`. N-ary two-pointer intersection over posting lists,
+  walked smallest-first.
+
+Algorithm choices
+-----------------
+
+* **Conjunctive (AND) semantics for `find`** match the brief's
+  requirement and are the lecture-taught default for web search
+  (NOTES.md L13 p.10). A returned URL must contain *every* query term.
+
+* **N-ary two-pointer intersection** (NOTES.md L13 p.12). Each posting
+  list is sorted by ``doc_id`` ascending — an :class:`InvertedIndex`
+  invariant — so we keep one pointer per list, find the maximum
+  current ``doc_id``, advance every pointer below it, emit when all
+  pointers agree, and stop the moment any list is exhausted.
+  Complexity is O(sum of list lengths).
+
+* **Document-at-a-time evaluation** (NOTES.md L13 pp.4-9). Walks all
+  posting lists in parallel with constant memory rather than
+  accumulating partial scores per term. Cleaner to explain in the
+  video walkthrough and the right pick at the quotes.toscrape.com
+  scale where a priority queue isn't needed.
+
+* **Sort-by-length rare+common optimisation** (NOTES.md L13 p.10).
+  Posting lists are walked smallest-first so a query like
+  ``"fish locomotion"`` skips most of the long list's postings.
+  Externally observable behaviour is the same regardless of list
+  order; the sort only changes the wall-clock cost.
+
+* **Tokenisation symmetry**. Both ``find`` and ``print_entry`` route
+  the user's input through :func:`src.indexer.tokenise` — the same
+  function the indexer uses. Skipping that step is the easiest way
+  to introduce query/index drift; pinning it explicitly makes the
+  symmetry impossible to break by accident.
+
+Out of scope
+------------
+
+* **Ranking** — TF-IDF, PageRank, anchor-text scoring. The brief asks
+  for AND semantics; ranking is the 80-100 stretch (NOTES.md L10).
+  Positions and counts are stored in the index so a future ranking
+  layer can be built on top without rebuilding.
+
+* **Skip pointers / list skipping** (NOTES.md L13 pp.13-17).
+  Irrelevant at our corpus scale. Worth mentioning in the video as a
+  "what I'd do next" talking point.
+
+* **Term-at-a-time evaluation**. The alternative to document-at-a-time
+  (NOTES.md L13 pp.4-9). Reads each posting list once but needs an
+  accumulator hash table; the trade-off doesn't pay off at this scale.
+
+* **Phrase queries**. Positions are recorded by the indexer but search
+  treats queries as bag-of-words AND. Phrase support is a v2 feature
+  the position data already enables.
+
+* **Disjunctive (OR) queries**. Not in the brief.
+
+* **Index mutation**. Search reads, never writes.
 """
 
 from __future__ import annotations

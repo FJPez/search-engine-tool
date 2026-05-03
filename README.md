@@ -6,7 +6,8 @@ COMP3011 Coursework 2 — a Python CLI search engine that crawls [quotes.toscrap
 
 - ✅ Crawler ([`src/crawler.py`](src/crawler.py)) — breadth-first, single-host, 6 s politeness window, retry-aware, fully unit-tested with mocked HTTP.
 - ✅ Indexer ([`src/indexer.py`](src/indexer.py)) — two-pass tokenisation (BS4 + `\W+` split with apostrophe stripping), inverted index with per-posting positions and per-document field extents, single-file JSON persistence with strict load-time validation.
-- ⏳ Search, CLI — not yet implemented.
+- ✅ Search ([`src/search.py`](src/search.py)) — N-ary two-pointer intersection for conjunctive AND queries with rare+common-term optimisation, formatted single-word entry printing, tokenisation shared with the indexer.
+- ⏳ CLI — not yet implemented.
 
 ## Setup
 
