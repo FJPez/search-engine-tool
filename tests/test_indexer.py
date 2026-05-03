@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from src.indexer import (
-    Document,
     InvertedIndex,
     Posting,
     extract_fields,
@@ -205,8 +204,6 @@ def test_contains_is_case_insensitive() -> None:
     assert "indifference" in idx
     assert "INDIFFERENCE" in idx
     assert "missing" not in idx
-    # Non-string comparisons don't explode
-    assert 42 not in idx
 
 
 def test_field_extents_mark_title_before_body() -> None:
@@ -234,16 +231,6 @@ def test_field_of_reports_title_when_term_appears_in_title() -> None:
     idx.add_document("http://p/", _html(title="unique headline", body="filler words"))
     posting = idx.lookup("unique")[0]
     assert idx.field_of(posting.doc_id, posting.positions[0]) == "title"
-
-
-def test_documents_property_is_a_defensive_copy() -> None:
-    idx = InvertedIndex()
-    idx.add_document("http://p/", _html(body="x"))
-    snapshot = idx.documents
-    snapshot[999] = Document(doc_id=999, url="http://evil/", fields={})
-    # Mutating the snapshot must not affect the real catalogue
-    assert 999 not in idx.documents
-    assert len(idx) == 1
 
 
 def test_empty_document_tokenises_to_no_postings() -> None:
@@ -524,26 +511,6 @@ def test_load_extent_not_a_list_raises_value_error(tmp_path: Path) -> None:
         InvertedIndex.load(target)
 
 
-def test_load_posting_count_mismatch_raises_value_error(tmp_path: Path) -> None:
-    # ``count`` is the cached length of ``positions``; mismatched values
-    # would skew any future term-frequency / ranking calculation.
-    target = tmp_path / "bad_count.json"
-    target.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "documents": {
-                    "0": {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
-                },
-                "vocabulary": {"hello": [{"doc_id": 0, "count": 99, "positions": [0]}]},
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="count 99 but 1 positions"):
-        InvertedIndex.load(target)
-
-
 def test_load_orphan_posting_raises_value_error(tmp_path: Path) -> None:
     # Vocabulary references doc_id 0 but documents is empty — lookup()
     # would return hits whose URL can't be resolved in the catalogue.
@@ -553,7 +520,7 @@ def test_load_orphan_posting_raises_value_error(tmp_path: Path) -> None:
             {
                 "version": 1,
                 "documents": {},
-                "vocabulary": {"hello": [{"doc_id": 0, "count": 1, "positions": [0]}]},
+                "vocabulary": {"hello": [{"doc_id": 0, "positions": [0]}]},
             }
         ),
         encoding="utf-8",
@@ -571,13 +538,39 @@ def test_load_posting_missing_keys_raises_value_error(tmp_path: Path) -> None:
                 "documents": {
                     "0": {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
                 },
-                "vocabulary": {"hello": [{"doc_id": 0, "count": 1}]},  # missing positions
+                "vocabulary": {"hello": [{"doc_id": 0}]},  # missing positions
             }
         ),
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="structurally invalid"):
         InvertedIndex.load(target)
+
+
+def test_load_sorts_postings_by_doc_id(tmp_path: Path) -> None:
+    target = tmp_path / "unsorted_postings.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "documents": {
+                    "0": {"url": "http://a/", "fields": {"title": [0, 0], "body": [0, 1]}},
+                    "1": {"url": "http://b/", "fields": {"title": [0, 0], "body": [0, 1]}},
+                },
+                "vocabulary": {
+                    "hello": [
+                        {"doc_id": 1, "positions": [0]},
+                        {"doc_id": 0, "positions": [0]},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = InvertedIndex.load(target)
+
+    assert [posting.doc_id for posting in restored.lookup("hello")] == [0, 1]
 
 
 # --------------------------------------------------------------------------

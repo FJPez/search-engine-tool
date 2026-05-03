@@ -147,8 +147,6 @@ def tokenise(text: str) -> list[str]:
     tokens and index tokens round-trip identically — a symmetry that any
     future search layer depends on.
     """
-    if not text:
-        return []
     normalised = text.lower().translate(_APOSTROPHE_STRIP)
     return [token for token in _TOKEN_SPLIT.split(normalised) if token]
 
@@ -167,17 +165,19 @@ def extract_fields(html: str) -> dict[str, str]:
     inline elements don't glue together (``<p>hello<b>world</b></p>`` comes
     back as ``"hello world"``, not ``"helloworld"``).
     """
-    soup = BeautifulSoup(html or "", "lxml")
+    soup = BeautifulSoup(html, "lxml")
     for tag in soup(_NON_CONTENT_TAGS):
         tag.decompose()
 
     title_tag = soup.title
-    title = title_tag.get_text(strip=True) if title_tag is not None else ""
-
-    # ``<title>`` is inside ``<head>`` and ``soup.get_text`` would otherwise
-    # include it in the body — drop it so the two streams don't overlap.
     if title_tag is not None:
+        title = title_tag.get_text(strip=True)
+        # ``<title>`` is inside ``<head>`` and ``soup.get_text`` would
+        # otherwise include it in the body — drop it so the two streams
+        # don't overlap.
         title_tag.decompose()
+    else:
+        title = ""
 
     body = soup.get_text(separator=" ")
     return {"title": title, "body": body}
@@ -304,17 +304,13 @@ class InvertedIndex:
 
     @property
     def documents(self) -> dict[int, Document]:
-        """Read-only view of the ``doc_id → Document`` catalogue."""
-        # Copy shields the internal dict from mutation by callers. Cheap at
-        # the scale this coursework operates on (tens of pages).
-        return dict(self._documents)
+        """The ``doc_id → Document`` catalogue."""
+        return self._documents
 
     def __len__(self) -> int:
         return len(self._documents)
 
-    def __contains__(self, word: object) -> bool:
-        if not isinstance(word, str):
-            return False
+    def __contains__(self, word: str) -> bool:
         return word.lower() in self._postings
 
     # ----------------------------------------------------------------------
@@ -345,12 +341,12 @@ class InvertedIndex:
                 for doc in self._documents.values()
             },
             "vocabulary": {
+                # ``count`` is intentionally not serialised: it is
+                # ``len(positions)`` by definition (see ``Posting``) and
+                # storing it would only let the on-disk copies disagree.
+                # ``load`` recomputes it on the way back in.
                 term: [
-                    {
-                        "doc_id": posting.doc_id,
-                        "count": posting.count,
-                        "positions": list(posting.positions),
-                    }
+                    {"doc_id": posting.doc_id, "positions": list(posting.positions)}
                     for posting in postings
                 ]
                 for term, postings in self._postings.items()
@@ -444,18 +440,11 @@ class InvertedIndex:
                             f"vocabulary entry {term!r} references unknown doc_id {posting_doc_id}"
                         )
                     positions = tuple(int(pos) for pos in p["positions"])
-                    count = int(p["count"])
-                    # ``count`` is meant to be cached ``len(positions)``;
-                    # disagreement is corruption that would later skew any
-                    # term-frequency computation built on top of postings.
-                    if count != len(positions):
-                        raise ValueError(
-                            f"vocabulary entry {term!r} for doc_id "
-                            f"{posting_doc_id} has count {count} but "
-                            f"{len(positions)} positions"
-                        )
-                    parsed.append(Posting(doc_id=posting_doc_id, count=count, positions=positions))
-                index._postings[term] = parsed
+                    # ``count`` is derived rather than read — see ``save``.
+                    parsed.append(
+                        Posting(doc_id=posting_doc_id, count=len(positions), positions=positions)
+                    )
+                index._postings[term] = sorted(parsed, key=lambda posting: posting.doc_id)
         except (KeyError, TypeError, AttributeError, IndexError) as exc:
             raise ValueError(f"Index file {source} is structurally invalid: {exc}") from exc
 
