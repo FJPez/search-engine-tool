@@ -12,6 +12,7 @@ from src.indexer import (
     InvertedIndex,
     Posting,
     extract_fields,
+    extract_tags,
     tokenise,
 )
 from tests.conftest import HtmlFactory, SingleDocIndexFactory
@@ -132,6 +133,37 @@ def test_extract_fields_whitespace_only_title_is_empty(html: HtmlFactory) -> Non
 
 
 # --------------------------------------------------------------------------
+# extract_tags
+# --------------------------------------------------------------------------
+
+
+def test_extract_tags_from_quote_cards(html: HtmlFactory) -> None:
+    body = """
+    <div class="quote">
+      <span class="text">Quote</span>
+      <div class="tags">
+        Tags:
+        <a class="tag" href="/tag/life/page/1/">life</a>
+        <a class="tag" href="/tag/inspirational/page/1/">inspirational</a>
+      </div>
+    </div>
+    """
+    assert extract_tags(html(body=body)) == ("life", "inspirational")
+
+
+def test_extract_tags_dedupes_and_normalises(html: HtmlFactory) -> None:
+    body = """
+    <div class="quote">
+      <a class="tag">Life</a>
+      <a class="tag">life</a>
+      <a class="tag">deep-thoughts</a>
+      <a class="tag">!!!</a>
+    </div>
+    """
+    assert extract_tags(html(body=body)) == ("life", "deep")
+
+
+# --------------------------------------------------------------------------
 # InvertedIndex.add_document / lookup / field_of
 # --------------------------------------------------------------------------
 
@@ -203,6 +235,26 @@ def test_field_extents_mark_title_before_body(single_doc_index: SingleDocIndexFa
     idx = single_doc_index(title="alpha beta", body="gamma delta")
     doc = idx.documents[0]
     assert doc.fields == {"title": (0, 2), "body": (2, 4)}
+
+
+def test_add_document_stores_tags(html: HtmlFactory) -> None:
+    idx = InvertedIndex()
+    body = '<div class="quote"><a class="tag">life</a><a class="tag">humor</a></div>'
+    idx.add_document("http://q/", html(body=body))
+    assert idx.documents[0].tags == ("life", "humor")
+
+
+def test_documents_with_tag_returns_matching_doc_ids(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body='<div class="quote"><a class="tag">life</a></div>')),
+            ("http://q/2", html(body='<div class="quote"><a class="tag">humor</a></div>')),
+            ("http://q/3", html(body='<div class="quote"><a class="tag">Life</a></div>')),
+        ]
+    )
+
+    assert idx.documents_with_tag("LIFE") == {0, 2}
+    assert idx.documents_with_tag("missing") == set()
 
 
 def test_field_of_resolves_title_and_body_positions(
@@ -302,11 +354,21 @@ def test_save_writes_valid_json_with_expected_top_level_shape(
     target = tmp_path / "index.json"
     populated_index.save(target)
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert set(payload) == {"version", "documents", "vocabulary"}
     # Doc keys serialise as strings; URL is stored on each document
     assert "0" in payload["documents"]
     assert payload["documents"]["0"]["url"] == "http://quotes.toscrape.com/"
+
+
+def test_save_writes_tags(tmp_path: Path, html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [("http://q/", html(body='<div class="quote"><a class="tag">life</a></div>'))]
+    )
+    target = tmp_path / "index.json"
+    idx.save(target)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["documents"]["0"]["tags"] == ["life"]
 
 
 def test_save_preserves_unicode_tokens_unescaped(
@@ -370,7 +432,7 @@ def test_load_missing_file_raises_file_not_found(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-_DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
+_DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}, "tags": []}
 
 
 @pytest.mark.parametrize(
@@ -378,21 +440,21 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
     [
         pytest.param("this is not json {", "not valid JSON", id="malformed-json"),
         pytest.param(json.dumps([1, 2, 3]), "JSON object", id="non-object-payload"),
-        pytest.param(json.dumps({"version": 1}), "documents", id="missing-top-level-keys"),
+        pytest.param(json.dumps({"version": 2}), "documents", id="missing-top-level-keys"),
         pytest.param(
             json.dumps({"version": 999, "documents": {}, "vocabulary": {}}),
             "version",
             id="version-mismatch",
         ),
         pytest.param(
-            json.dumps({"version": 1, "documents": {"0": {"url": "http://p/"}}, "vocabulary": {}}),
+            json.dumps({"version": 2, "documents": {"0": {"url": "http://p/"}}, "vocabulary": {}}),
             "structurally invalid",
             id="document-missing-fields",
         ),
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {"0": {"fields": {"title": [0, 0], "body": [0, 0]}}},
                     "vocabulary": {},
                 }
@@ -403,7 +465,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {"0": {"url": "http://p/", "fields": {}}},
                     "vocabulary": {},
                 }
@@ -414,7 +476,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {"0": {"url": "http://p/", "fields": {"title": [0, 0]}}},
                     "vocabulary": {},
                 }
@@ -425,7 +487,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {"0": {"url": "http://p/", "fields": []}},
                     "vocabulary": {},
                 }
@@ -436,7 +498,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {
                         "0": {"url": "http://p/", "fields": {"title": [0], "body": [0, 1]}}
                     },
@@ -449,7 +511,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {
                         "0": {"url": "http://p/", "fields": {"title": 0, "body": [0, 1]}}
                     },
@@ -462,7 +524,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {},
                     "vocabulary": {"hello": [{"doc_id": 0, "positions": [0]}]},
                 }
@@ -473,7 +535,7 @@ _DOC_OK = {"url": "http://p/", "fields": {"title": [0, 0], "body": [0, 1]}}
         pytest.param(
             json.dumps(
                 {
-                    "version": 1,
+                    "version": 2,
                     "documents": {"0": _DOC_OK},
                     "vocabulary": {"hello": [{"doc_id": 0}]},
                 }
@@ -495,10 +557,18 @@ def test_load_sorts_postings_by_doc_id(tmp_path: Path) -> None:
     target.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "documents": {
-                    "0": {"url": "http://a/", "fields": {"title": [0, 0], "body": [0, 1]}},
-                    "1": {"url": "http://b/", "fields": {"title": [0, 0], "body": [0, 1]}},
+                    "0": {
+                        "url": "http://a/",
+                        "fields": {"title": [0, 0], "body": [0, 1]},
+                        "tags": [],
+                    },
+                    "1": {
+                        "url": "http://b/",
+                        "fields": {"title": [0, 0], "body": [0, 1]},
+                        "tags": [],
+                    },
                 },
                 "vocabulary": {
                     "hello": [
