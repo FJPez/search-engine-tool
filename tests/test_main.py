@@ -173,6 +173,35 @@ def test_find_prints_zero_results_message(tmp_path: Path, html: HtmlFactory) -> 
     assert "No pages found" in output.getvalue()
 
 
+def test_explain_prints_query_explanation(tmp_path: Path, html: HtmlFactory) -> None:
+    shell, output = _shell(tmp_path)
+    shell.index = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='love good friends <div class="quote"><a class="tag">life</a></div>'),
+            )
+        ]
+    )
+
+    assert shell.run_command('explain love "good friends" tag:life') is True
+
+    text = output.getvalue()
+    assert "terms: love" in text
+    assert "phrases: good friends" in text
+    assert "tags: life" in text
+    assert "http://q/1" in text
+
+
+def test_explain_requires_query_terms(tmp_path: Path, html: HtmlFactory) -> None:
+    shell, output = _shell(tmp_path)
+    shell.index = InvertedIndex.from_pages([("http://q/1", html(body="good"))])
+
+    assert shell.run_command("explain") is True
+
+    assert "Usage: explain <query>" in output.getvalue()
+
+
 def test_unknown_command_prints_help_hint(tmp_path: Path) -> None:
     shell, output = _shell(tmp_path)
 
