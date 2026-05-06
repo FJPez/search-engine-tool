@@ -85,6 +85,11 @@ Out of scope
 
 from __future__ import annotations
 
+import re
+import shlex
+from dataclasses import dataclass
+from re import Match
+
 from src.indexer import InvertedIndex, Posting, tokenise
 
 
@@ -141,6 +146,100 @@ def _intersect_postings(lists: list[list[Posting]]) -> list[int]:
                 return result
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedQuery:
+    terms: list[str]
+    tags: list[str]
+    phrases: list[list[str]]
+
+
+def _parse_query(query: str) -> _ParsedQuery:
+    """Split raw query text into normal terms and ``tag:`` filters."""
+    phrases: list[list[str]] = []
+
+    def _collect_phrase(match: Match[str]) -> str:
+        phrase_tokens = tokenise(match.group(1))
+        if phrase_tokens:
+            phrases.append(phrase_tokens)
+        return " "
+
+    query_without_phrases = re.sub(r'"([^"]*)"', _collect_phrase, query)
+    try:
+        parts = shlex.split(query_without_phrases)
+    except ValueError:
+        parts = query_without_phrases.split()
+
+    normal_parts: list[str] = []
+    tags: list[str] = []
+    for part in parts:
+        if part.lower().startswith("tag:"):
+            tag_tokens = tokenise(part[4:])
+            if tag_tokens:
+                tags.append(tag_tokens[0])
+            continue
+        normal_parts.append(part)
+
+    return _ParsedQuery(terms=tokenise(" ".join(normal_parts)), tags=tags, phrases=phrases)
+
+
+def _phrase_doc_ids(index: InvertedIndex, phrase: list[str]) -> set[int]:
+    """Return documents where *phrase* occurs in adjacent token positions."""
+    if not phrase:
+        return set()
+    if len(phrase) == 1:
+        return {posting.doc_id for posting in index.lookup(phrase[0])}
+
+    postings_by_term = [index.lookup(term) for term in phrase]
+    if any(not postings for postings in postings_by_term):
+        return set()
+
+    by_doc = [{posting.doc_id: posting for posting in postings} for postings in postings_by_term]
+    common_doc_ids = set(by_doc[0])
+    for postings in by_doc[1:]:
+        common_doc_ids &= postings.keys()
+
+    matches: set[int] = set()
+    for doc_id in common_doc_ids:
+        following_positions = [
+            set(by_doc[offset][doc_id].positions) for offset in range(1, len(phrase))
+        ]
+        for start_position in by_doc[0][doc_id].positions:
+            if all(
+                start_position + offset + 1 in following_positions[offset]
+                for offset in range(len(following_positions))
+            ):
+                matches.add(doc_id)
+                break
+    return matches
+
+
+def _score_doc(index: InvertedIndex, doc_id: int, parsed: _ParsedQuery) -> float:
+    """Return a simple explainable relevance score for one matched document."""
+    score = 0.0
+
+    for term in parsed.terms:
+        for posting in index.lookup(term):
+            if posting.doc_id != doc_id:
+                continue
+            score += posting.count
+            title_hits = sum(
+                1 for position in posting.positions if index.field_of(doc_id, position) == "title"
+            )
+            score += title_hits
+            break
+
+    for phrase in parsed.phrases:
+        if doc_id in _phrase_doc_ids(index, phrase):
+            score += 5.0
+
+    document = index.documents[doc_id]
+    for tag in parsed.tags:
+        if tag in document.tags:
+            score += 2.0
+
+    return score
+
+
 def find(index: InvertedIndex, query: str) -> list[str]:
     """Return URLs of documents containing every word in *query*.
 
@@ -162,15 +261,77 @@ def find(index: InvertedIndex, query: str) -> list[str]:
     crawler emitted the pages, which is the most predictable thing to
     hand to the CLI's ``print``.
     """
-    tokens = tokenise(query)
-    if not tokens:
+    parsed = _parse_query(query)
+    if not parsed.terms and not parsed.tags and not parsed.phrases:
         return []
 
-    posting_lists = [index.lookup(token) for token in tokens]
-    matched_doc_ids = _intersect_postings(posting_lists)
+    documents = index.documents
+    if parsed.terms:
+        posting_lists = [index.lookup(token) for token in parsed.terms]
+        matched_doc_ids = set(_intersect_postings(posting_lists))
+    else:
+        matched_doc_ids = set(documents)
+
+    for phrase in parsed.phrases:
+        matched_doc_ids &= _phrase_doc_ids(index, phrase)
+        if not matched_doc_ids:
+            return []
+
+    for tag in parsed.tags:
+        matched_doc_ids &= index.documents_with_tag(tag)
+        if not matched_doc_ids:
+            return []
+
+    ranked_doc_ids = sorted(
+        matched_doc_ids,
+        key=lambda doc_id: (-_score_doc(index, doc_id, parsed), doc_id),
+    )
+    return [documents[doc_id].url for doc_id in ranked_doc_ids]
+
+
+def explain(index: InvertedIndex, query: str) -> str:
+    """Return a human-readable explanation of how *query* is evaluated."""
+    parsed = _parse_query(query)
+    lines = [
+        f"terms: {_format_list(parsed.terms)}",
+        f"phrases: {_format_phrases(parsed.phrases)}",
+        f"tags: {_format_list(parsed.tags)}",
+    ]
+
+    if not parsed.terms and not parsed.tags and not parsed.phrases:
+        lines.append("matches: 0")
+        return "\n".join(lines)
 
     documents = index.documents
-    return [documents[doc_id].url for doc_id in matched_doc_ids]
+    if parsed.terms:
+        posting_lists = [index.lookup(token) for token in parsed.terms]
+        matched_doc_ids = set(_intersect_postings(posting_lists))
+    else:
+        matched_doc_ids = set(documents)
+
+    for phrase in parsed.phrases:
+        matched_doc_ids &= _phrase_doc_ids(index, phrase)
+    for tag in parsed.tags:
+        matched_doc_ids &= index.documents_with_tag(tag)
+
+    ranked_doc_ids = sorted(
+        matched_doc_ids,
+        key=lambda doc_id: (-_score_doc(index, doc_id, parsed), doc_id),
+    )
+    lines.append(f"matches: {len(ranked_doc_ids)}")
+    for doc_id in ranked_doc_ids:
+        lines.append(f"  {documents[doc_id].url}  score={_score_doc(index, doc_id, parsed):.1f}")
+    return "\n".join(lines)
+
+
+def _format_list(values: list[str]) -> str:
+    return ", ".join(values) if values else "(none)"
+
+
+def _format_phrases(phrases: list[list[str]]) -> str:
+    if not phrases:
+        return "(none)"
+    return ", ".join(" ".join(phrase) for phrase in phrases)
 
 
 def print_entry(index: InvertedIndex, word: str) -> str:

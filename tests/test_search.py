@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.indexer import InvertedIndex, Posting
-from src.search import _intersect_postings, find, print_entry
+from src.search import _intersect_postings, explain, find, print_entry
 from tests.conftest import HtmlFactory, SingleDocIndexFactory
 
 
@@ -197,6 +197,116 @@ def test_find_repeated_term_in_query_is_idempotent(three_doc_index: InvertedInde
     # posting list with itself gives the same list back. Behaviourally
     # equivalent to the single-term query.
     assert find(three_doc_index, "good good") == find(three_doc_index, "good")
+
+
+def test_find_tag_filter_only_returns_tagged_documents(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body='<div class="quote"><a class="tag">life</a></div>')),
+            ("http://q/2", html(body='<div class="quote"><a class="tag">humor</a></div>')),
+            ("http://q/3", html(body='<div class="quote"><a class="tag">life</a></div>')),
+        ]
+    )
+
+    assert find(idx, "tag:life") == ["http://q/1", "http://q/3"]
+
+
+def test_find_text_and_tag_filter_must_both_match(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body='love <div class="quote"><a class="tag">life</a></div>')),
+            ("http://q/2", html(body='love <div class="quote"><a class="tag">humor</a></div>')),
+            ("http://q/3", html(body='truth <div class="quote"><a class="tag">life</a></div>')),
+        ]
+    )
+
+    assert find(idx, "love tag:life") == ["http://q/1"]
+
+
+def test_find_multiple_tag_filters_use_and_semantics(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(
+                    body=(
+                        '<div class="quote"><a class="tag">life</a><a class="tag">truth</a></div>'
+                    )
+                ),
+            ),
+            ("http://q/2", html(body='<div class="quote"><a class="tag">life</a></div>')),
+        ]
+    )
+
+    assert find(idx, "tag:life tag:truth") == ["http://q/1"]
+
+
+def test_find_invalid_tag_filter_does_not_crash(three_doc_index: InvertedIndex) -> None:
+    assert find(three_doc_index, "tag:") == []
+
+
+def test_find_quoted_phrase_requires_adjacent_positions(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body="good friends stay")),
+            ("http://q/2", html(body="good loyal friends")),
+            ("http://q/3", html(body="friends good")),
+        ]
+    )
+
+    assert find(idx, '"good friends"') == ["http://q/1"]
+
+
+def test_find_phrase_combines_with_terms_and_tags(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='kind good friends <div class="quote"><a class="tag">life</a></div>'),
+            ),
+            (
+                "http://q/2",
+                html(body='kind good friends <div class="quote"><a class="tag">humor</a></div>'),
+            ),
+            (
+                "http://q/3",
+                html(body='good friends <div class="quote"><a class="tag">life</a></div>'),
+            ),
+        ]
+    )
+
+    assert find(idx, 'kind "good friends" tag:life') == ["http://q/1"]
+
+
+def test_find_ranks_stronger_term_frequency_before_crawl_order(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body="good")),
+            ("http://q/2", html(body="good good good")),
+            ("http://q/3", html(body="good good")),
+        ]
+    )
+
+    assert find(idx, "good") == ["http://q/2", "http://q/3", "http://q/1"]
+
+
+def test_explain_includes_parsed_query_and_scores(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='love good friends <div class="quote"><a class="tag">life</a></div>'),
+            )
+        ]
+    )
+
+    output = explain(idx, 'love "good friends" tag:life')
+
+    assert "terms: love" in output
+    assert "phrases: good friends" in output
+    assert "tags: life" in output
+    assert "http://q/1" in output
+    assert "score=" in output
 
 
 # --------------------------------------------------------------------------
