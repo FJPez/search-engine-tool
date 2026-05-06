@@ -25,7 +25,7 @@ requirements.txt  README.md
 - **Single-file index** persisted to disk (acceptable simplification per brief).
 - **CLI commands** (exact names) — the tool is a shell that accepts:
   - `build` — crawl, build index, save to disk
-  - `load`  — load previously-saved index
+  - `load` — load previously-saved index
   - `print <word>` — print inverted index entry for a word
   - `find <w1> [w2 ...]` — return pages containing **all** given words (multi-word = conjunctive)
 - **Edge cases** to handle explicitly: non-existent words, empty queries, multi-word queries, network failures.

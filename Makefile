@@ -1,8 +1,9 @@
-.PHONY: help install sync lint format typecheck test cov check clean hooks export-reqs
+.PHONY: help install sync run lint format typecheck test cov check clean hooks export-reqs
 
 help:
 	@echo "Targets:"
 	@echo "  install     Install all deps (incl. dev) via uv sync"
+	@echo "  run         Launch the interactive search shell"
 	@echo "  hooks       Install pre-commit git hooks"
 	@echo "  lint        Run ruff lint"
 	@echo "  format      Run ruff format"
@@ -15,6 +16,9 @@ help:
 
 install sync:
 	uv sync
+
+run:
+	uv run python -m src.main
 
 hooks:
 	uv run pre-commit install
