@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import sys
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from src.crawler import PoliteCrawler
+from src.crawler import DEFAULT_DELAY, PoliteCrawler
 from src.indexer import InvertedIndex
 from src.search import find, print_entry
 
 DEFAULT_START_URL = "https://quotes.toscrape.com/"
 DEFAULT_INDEX_PATH = Path("data/index.json")
+_SHELL_HANDLER_ATTR = "_search_shell_handler"
 
 
 class SearchShell:
@@ -28,6 +32,12 @@ class SearchShell:
         self.start_url = start_url
         self.output = output
         self.index: InvertedIndex | None = None
+        self.verbose = False
+        self._logger = logging.getLogger(f"{__name__}.SearchShell.{id(self)}")
+        self._log_handler = logging.StreamHandler(output)
+        self._log_handler.setFormatter(logging.Formatter("%(message)s"))
+        setattr(self._log_handler, _SHELL_HANDLER_ATTR, True)
+        self._configure_logging()
 
     def run_command(self, line: str) -> bool:
         """Run one command line. Return ``False`` when the shell should exit."""
@@ -41,13 +51,15 @@ class SearchShell:
 
         match command:
             case "build":
-                self._build()
+                self._build(argument)
             case "load":
                 self._load()
             case "print":
                 self._print(argument)
             case "find":
                 self._find(argument)
+            case "verbose":
+                self._verbose(argument)
             case "help":
                 self._help()
             case "exit" | "quit":
@@ -58,20 +70,55 @@ class SearchShell:
 
         return True
 
-    def _build(self) -> None:
+    def _build(self, argument: str) -> None:
+        max_pages = self._parse_max_pages(argument)
+        if max_pages == 0:
+            self._write("Usage: build [max_pages]")
+            return
+
+        crawler_logger_state = self._attach_crawler_logger()
         try:
-            crawler = PoliteCrawler(self.start_url)
-            index = InvertedIndex.from_pages(crawler.crawl())
+            crawler = PoliteCrawler(self.start_url, max_pages=max_pages)
+            self._logger.info("Building index from %s", self.start_url)
+            self._logger.info("Limit: %s", _format_limit(max_pages))
+            self._logger.info("Politeness delay: %.0f seconds between requests", DEFAULT_DELAY)
+            index = InvertedIndex.from_pages(self._report_pages(crawler.crawl()))
             index.save(self.index_path)
         except Exception as exc:
             self._write(f"Build failed: {exc}")
             return
+        finally:
+            self._restore_crawler_logger(crawler_logger_state)
 
         self.index = index
-        self._write(
-            f"Built index for {len(index)} {_document_label(len(index))}; "
-            f"saved to {self.index_path}"
+        self._logger.info(
+            "Built index for %d %s; saved to %s",
+            len(index),
+            _document_label(len(index)),
+            self.index_path,
         )
+
+    def _parse_max_pages(self, argument: str) -> int | None:
+        if not argument:
+            return None
+
+        parts = argument.split()
+        if len(parts) != 1:
+            return 0
+
+        try:
+            max_pages = int(parts[0])
+        except ValueError:
+            return 0
+
+        if max_pages < 1:
+            return 0
+        return max_pages
+
+    def _report_pages(self, pages: Iterable[tuple[str, str]]) -> Iterator[tuple[str, str]]:
+        for count, (url, html) in enumerate(pages, start=1):
+            self._logger.info("Indexed %d: %s", count, url)
+            yield url, html
 
     def _load(self) -> None:
         try:
@@ -111,15 +158,81 @@ class SearchShell:
         for url in results:
             self._write(url)
 
+    def _verbose(self, argument: str) -> None:
+        if not argument:
+            state = "on" if self.verbose else "off"
+            self._write(f"Verbose mode is {state}")
+            return
+
+        match argument.lower():
+            case "on":
+                self.verbose = True
+                self._configure_logging()
+                self._write("Verbose mode is on")
+            case "off":
+                self.verbose = False
+                self._configure_logging()
+                self._write("Verbose mode is off")
+            case _:
+                self._write("Usage: verbose on|off")
+
     def _help(self) -> None:
-        self._write("Commands: build, load, print <word>, find <word> [word ...], help, exit")
+        self._write(
+            "Commands: build [max_pages], load, print <word>, "
+            "find <word> [word ...], verbose on|off, help, exit"
+        )
 
     def _write(self, message: str) -> None:
         print(message, file=self.output)
 
+    def _configure_logging(self) -> None:
+        level = logging.DEBUG if self.verbose else logging.INFO
+        self._logger.setLevel(level)
+        self._logger.propagate = False
+        self._log_handler.setLevel(level)
+        if self._log_handler not in self._logger.handlers:
+            self._logger.addHandler(self._log_handler)
+
+    def _attach_crawler_logger(self) -> _LoggerState:
+        logger = logging.getLogger("src.crawler")
+        state = _LoggerState(
+            level=logger.level,
+            propagate=logger.propagate,
+            handlers=list(logger.handlers),
+        )
+        logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
+        logger.propagate = False
+        logger.handlers = [
+            handler
+            for handler in logger.handlers
+            if not getattr(handler, _SHELL_HANDLER_ATTR, False)
+        ]
+        logger.addHandler(self._log_handler)
+        return state
+
+    def _restore_crawler_logger(self, state: _LoggerState) -> None:
+        logger = logging.getLogger("src.crawler")
+        logger.setLevel(state.level)
+        logger.propagate = state.propagate
+        logger.handlers = state.handlers
+
+
+@dataclass(frozen=True, slots=True)
+class _LoggerState:
+    level: int
+    propagate: bool
+    handlers: list[logging.Handler]
+
 
 def _document_label(count: int) -> str:
     return "document" if count == 1 else "documents"
+
+
+def _format_limit(max_pages: int | None) -> str:
+    if max_pages is None:
+        return "none"
+    label = "page" if max_pages == 1 else "pages"
+    return f"{max_pages} {label}"
 
 
 def main() -> int:

@@ -232,6 +232,7 @@ class PoliteCrawler:
         """
         for attempt in (1, 2):
             try:
+                logger.debug("Fetching %s (attempt %d)", url, attempt)
                 response = self._session.get(url, timeout=self._timeout)
             except requests.RequestException as exc:
                 logger.warning("Network error fetching %s (attempt %d): %s", url, attempt, exc)
@@ -241,10 +242,11 @@ class PoliteCrawler:
 
             status = response.status_code
             if status == 200:
+                logger.debug("Fetched %s: HTTP 200", response.url)
                 return response.url, response.text
 
             if status in _PERMANENT_SKIP_STATUS:
-                logger.info("Skipping %s: HTTP %d", url, status)
+                logger.debug("Skipping %s: HTTP %d", url, status)
                 return None
 
             if status == 429:
@@ -253,7 +255,7 @@ class PoliteCrawler:
                     return None
                 retry_after = _parse_retry_after(response.headers.get("Retry-After"))
                 back_off = max(self._delay, retry_after)
-                logger.info("HTTP 429 on %s; backing off %.1fs", url, back_off)
+                logger.debug("HTTP 429 on %s; backing off %.1fs", url, back_off)
                 self._sleep(back_off)
                 continue
 
@@ -261,7 +263,7 @@ class PoliteCrawler:
                 if attempt == 2:
                     logger.warning("Giving up on %s after HTTP %d on retry", url, status)
                     return None
-                logger.info("HTTP %d on %s; retrying", status, url)
+                logger.debug("HTTP %d on %s; retrying", status, url)
                 continue
 
             logger.warning("Unexpected HTTP %d on %s; skipping", status, url)
@@ -308,7 +310,9 @@ class PoliteCrawler:
             if last_fetch_end is not None:
                 elapsed = self._clock() - last_fetch_end
                 if elapsed < self._delay:
-                    self._sleep(self._delay - elapsed)
+                    wait = self._delay - elapsed
+                    logger.debug("Waiting %.1fs before fetching %s", wait, url)
+                    self._sleep(wait)
 
             result = self.fetch(url)
             last_fetch_end = self._clock()
@@ -328,7 +332,9 @@ class PoliteCrawler:
             yield canonical_final, html
             yielded += 1
 
-            for raw_link in extract_links(html, canonical_final):
+            links = extract_links(html, canonical_final)
+            logger.debug("Discovered %d crawlable links on %s", len(links), canonical_final)
+            for raw_link in links:
                 if not in_scope(raw_link, allowed_host):
                     continue
                 link = _force_scheme(raw_link, start_scheme)
