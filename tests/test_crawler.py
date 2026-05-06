@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+import urllib.error
+import urllib.request
 from collections.abc import Callable
+from email.message import Message
 
 import pytest
 import requests
 from requests_mock import Mocker
 
-from src.crawler import PoliteCrawler, canonicalise, extract_links, in_scope
+from src.crawler import PoliteCrawler, RobotsPolicy, canonicalise, extract_links, in_scope
 
 #: The seed host that tests pretend to crawl. Used wherever the exact URL
 #: string is *context* (the crawler's target, a base for relative-link
@@ -229,6 +233,29 @@ def test_extract_links_empty_returns_empty_list(html: str) -> None:
 CrawlerFactory = Callable[..., PoliteCrawler]
 
 
+class FakeRobots(RobotsPolicy):
+    def __init__(
+        self,
+        *,
+        allowed: bool | dict[str, bool] = True,
+        crawl_delay: int | float | None = None,
+    ) -> None:
+        self._allowed = allowed
+        self._crawl_delay = crawl_delay
+        self.checked_urls: list[str] = []
+
+    def can_fetch(self, useragent: str, url: str) -> bool:
+        del useragent
+        self.checked_urls.append(url)
+        if isinstance(self._allowed, dict):
+            return self._allowed.get(url, True)
+        return self._allowed
+
+    def crawl_delay(self, useragent: str) -> int | float | None:
+        del useragent
+        return self._crawl_delay
+
+
 @pytest.fixture
 def crawler_factory() -> CrawlerFactory:
     """Build a :class:`PoliteCrawler` with injected fakes for sleep and clock.
@@ -246,6 +273,8 @@ def crawler_factory() -> CrawlerFactory:
         clock: Callable[[], float] | None = None,
         max_pages: int | None = None,
         start_url: str = BASE_URL,
+        respect_robots: bool = False,
+        robot_parser: FakeRobots | None = None,
     ) -> PoliteCrawler:
         sleep: Callable[[float], None] = (
             sleep_calls.append if sleep_calls is not None else (lambda _s: None)
@@ -254,6 +283,8 @@ def crawler_factory() -> CrawlerFactory:
             start_url,
             delay=delay,
             max_pages=max_pages,
+            respect_robots=respect_robots,
+            robot_parser=robot_parser,
             sleep=sleep,
             clock=clock if clock is not None else (lambda: 0.0),
         )
@@ -536,6 +567,132 @@ def test_crawl_respects_max_pages_cap(
     crawler = crawler_factory(max_pages=2)
     results = [url for url, _ in crawler.crawl()]
     assert results == [BASE_URL, a]  # seed + one linked page, then stop
+
+
+def test_crawl_skips_seed_disallowed_by_robots(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    robots = FakeRobots(allowed=False)
+    requests_mock.get(BASE_URL, text=_html_with_links())
+    crawler = crawler_factory(respect_robots=True, robot_parser=robots)
+
+    with caplog.at_level(logging.DEBUG, logger="src.crawler"):
+        assert list(crawler.crawl()) == []
+    assert requests_mock.call_count == 0
+    assert robots.checked_urls == [BASE_URL]
+    assert "disallowed by robots.txt" in caplog.text
+
+
+def test_crawl_skips_child_link_disallowed_by_robots(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    allowed = f"{BASE_URL}allowed"
+    blocked = f"{BASE_URL}blocked"
+    robots = FakeRobots(allowed={BASE_URL: True, allowed: True, blocked: False})
+    requests_mock.get(BASE_URL, text=_html_with_links(allowed, blocked))
+    requests_mock.get(allowed, text=_html_with_links())
+    requests_mock.get(blocked, text=_html_with_links())
+    crawler = crawler_factory(respect_robots=True, robot_parser=robots)
+
+    results = [url for url, _ in crawler.crawl()]
+
+    assert results == [BASE_URL, allowed]
+    assert [request.url for request in requests_mock.request_history] == [BASE_URL, allowed]
+    assert blocked in robots.checked_urls
+
+
+def test_crawl_bypasses_robots_when_disabled(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    robots = FakeRobots(allowed=False)
+    requests_mock.get(BASE_URL, text=_html_with_links())
+    crawler = crawler_factory(respect_robots=False, robot_parser=robots)
+
+    results = [url for url, _ in crawler.crawl()]
+
+    assert results == [BASE_URL]
+    assert robots.checked_urls == []
+
+
+def test_crawl_uses_robots_crawl_delay_when_it_is_larger_than_default(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    sleep_calls: list[float] = []
+    robots = FakeRobots(crawl_delay=10)
+    page2 = f"{BASE_URL}page/2"
+    requests_mock.get(BASE_URL, text=_html_with_links(page2))
+    requests_mock.get(page2, text=_html_with_links())
+    crawler = crawler_factory(
+        delay=6.0,
+        sleep_calls=sleep_calls,
+        respect_robots=True,
+        robot_parser=robots,
+    )
+
+    list(crawler.crawl())
+
+    assert sleep_calls == [10.0]
+
+
+def test_crawl_ignores_robots_crawl_delay_below_coursework_minimum(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory
+) -> None:
+    sleep_calls: list[float] = []
+    robots = FakeRobots(crawl_delay=1)
+    page2 = f"{BASE_URL}page/2"
+    requests_mock.get(BASE_URL, text=_html_with_links(page2))
+    requests_mock.get(page2, text=_html_with_links())
+    crawler = crawler_factory(
+        delay=6.0,
+        sleep_calls=sleep_calls,
+        respect_robots=True,
+        robot_parser=robots,
+    )
+
+    list(crawler.crawl())
+
+    assert sleep_calls == [6.0]
+
+
+def test_crawl_continues_when_robots_txt_is_missing(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def raise_404(_url: str) -> None:
+        raise urllib.error.HTTPError(
+            f"{BASE_URL}robots.txt",
+            404,
+            "Not Found",
+            hdrs=Message(),
+            fp=None,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_404)
+    requests_mock.get(BASE_URL, text=_html_with_links())
+    crawler = crawler_factory(respect_robots=True)
+
+    results = [url for url, _ in crawler.crawl()]
+
+    assert results == [BASE_URL]
+
+
+def test_crawl_continues_when_robots_txt_cannot_be_read(
+    requests_mock: Mocker,
+    crawler_factory: CrawlerFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def raise_os_error(_url: str) -> None:
+        raise OSError("network down")
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_os_error)
+    requests_mock.get(BASE_URL, text=_html_with_links())
+    crawler = crawler_factory(respect_robots=True)
+
+    with caplog.at_level(logging.WARNING, logger="src.crawler"):
+        results = [url for url, _ in crawler.crawl()]
+
+    assert results == [BASE_URL]
+    assert "Could not read robots.txt" in caplog.text
 
 
 def test_crawl_yields_nothing_when_start_url_is_uncrawlable(

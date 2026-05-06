@@ -49,6 +49,8 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
+from typing import Protocol, cast
+from urllib import robotparser
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -65,6 +67,16 @@ _RETRYABLE_STATUS = frozenset({408, 500, 501, 502, 503, 504})
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class RobotsPolicy(Protocol):
+    """Subset of ``RobotFileParser`` used by :class:`PoliteCrawler`."""
+
+    def can_fetch(self, useragent: str, url: str) -> bool:
+        """Return whether *useragent* may fetch *url*."""
+
+    def crawl_delay(self, useragent: str) -> int | float | None:
+        """Return the configured crawl delay for *useragent*, if present."""
 
 
 def canonicalise(url: str, base: str | None = None) -> str | None:
@@ -201,6 +213,8 @@ class PoliteCrawler:
         timeout: float = DEFAULT_TIMEOUT,
         max_pages: int | None = None,
         user_agent: str = DEFAULT_USER_AGENT,
+        respect_robots: bool = True,
+        robot_parser: RobotsPolicy | None = None,
         session: requests.Session | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
@@ -209,6 +223,9 @@ class PoliteCrawler:
         self._delay = delay
         self._timeout = timeout
         self._max_pages = max_pages
+        self._user_agent = user_agent
+        self._respect_robots = respect_robots
+        self._robot_parser = robot_parser
         self._sleep = sleep
         self._clock = clock
         self._session = session or requests.Session()
@@ -293,6 +310,8 @@ class PoliteCrawler:
         start_parsed = urlparse(start_canonical)
         allowed_host = start_parsed.hostname or ""
         start_scheme = start_parsed.scheme  # locked for the lifetime of this crawl
+        robots = self._load_robots(start_canonical)
+        delay = self._effective_delay(robots)
         visited: set[str] = set()
         frontier: deque[str] = deque([start_canonical])
         last_fetch_end: float | None = None
@@ -307,10 +326,14 @@ class PoliteCrawler:
                 continue
             visited.add(url)
 
+            if not self._robots_allows(robots, url):
+                logger.debug("Skipping %s: disallowed by robots.txt", url)
+                continue
+
             if last_fetch_end is not None:
                 elapsed = self._clock() - last_fetch_end
-                if elapsed < self._delay:
-                    wait = self._delay - elapsed
+                if elapsed < delay:
+                    wait = delay - elapsed
                     logger.debug("Waiting %.1fs before fetching %s", wait, url)
                     self._sleep(wait)
 
@@ -341,3 +364,47 @@ class PoliteCrawler:
                 if link in visited:
                     continue
                 frontier.append(link)
+
+    def _load_robots(self, start_url: str) -> RobotsPolicy | None:
+        """Return a robots policy for *start_url*, or ``None`` if unavailable."""
+        if not self._respect_robots:
+            return None
+
+        if self._robot_parser is not None:
+            return self._robot_parser
+
+        parsed = urlparse(start_url)
+        robots_url = urlunparse((parsed.scheme, parsed.netloc, "/robots.txt", "", "", ""))
+        parser = robotparser.RobotFileParser(robots_url)
+        try:
+            parser.read()
+        except OSError as exc:
+            logger.warning("Could not read robots.txt at %s: %s", robots_url, exc)
+            return None
+
+        logger.debug("Loaded robots.txt from %s", robots_url)
+        return cast(RobotsPolicy, parser)
+
+    def _robots_allows(self, robots: RobotsPolicy | None, url: str) -> bool:
+        if robots is None:
+            return True
+
+        try:
+            return robots.can_fetch(self._user_agent, url)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Could not evaluate robots.txt rule for %s: %s", url, exc)
+            return True
+
+    def _effective_delay(self, robots: RobotsPolicy | None) -> float:
+        if robots is None:
+            return self._delay
+
+        try:
+            robots_delay = robots.crawl_delay(self._user_agent)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Could not read robots.txt crawl delay: %s", exc)
+            return self._delay
+
+        if robots_delay is None:
+            return self._delay
+        return max(self._delay, float(robots_delay))
