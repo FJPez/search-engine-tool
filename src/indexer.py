@@ -112,6 +112,8 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from src.crawler import extract_links
+
 # Bumped whenever the on-disk JSON shape changes in a way that older loaders
 # can't handle. Loading a file with a different version is a hard error: it
 # is safer to refuse than to silently misinterpret stored fields.
@@ -235,6 +237,8 @@ class Document:
     url: str
     fields: dict[str, tuple[int, int]] = field(default_factory=dict)
     tags: tuple[str, ...] = ()
+    links: tuple[str, ...] = ()
+    tokens: tuple[str, ...] = ()
 
 
 class InvertedIndex:
@@ -266,8 +270,10 @@ class InvertedIndex:
 
         fields = extract_fields(html)
         tags = extract_tags(html)
+        links = tuple(extract_links(html, url))
         title_tokens = tokenise(fields["title"])
         body_tokens = tokenise(fields["body"])
+        tokens = tuple(title_tokens + body_tokens)
 
         title_end = len(title_tokens)
         body_end = title_end + len(body_tokens)
@@ -279,7 +285,14 @@ class InvertedIndex:
         doc_id = self._next_id
         self._next_id += 1
 
-        self._documents[doc_id] = Document(doc_id=doc_id, url=url, fields=extents, tags=tags)
+        self._documents[doc_id] = Document(
+            doc_id=doc_id,
+            url=url,
+            fields=extents,
+            tags=tags,
+            links=links,
+            tokens=tokens,
+        )
         self._url_to_id[url] = doc_id
 
         # Build per-term position lists in one pass over the combined stream,
@@ -376,6 +389,8 @@ class InvertedIndex:
                     "url": doc.url,
                     "fields": {name: list(extent) for name, extent in doc.fields.items()},
                     "tags": list(doc.tags),
+                    "links": list(doc.links),
+                    "tokens": list(doc.tokens),
                 }
                 for doc in self._documents.values()
             },
@@ -452,12 +467,16 @@ class InvertedIndex:
                     raise ValueError(
                         f"document {raw_id} is missing field extents: {sorted(missing)}"
                     )
-                tags = tuple(str(tag) for tag in raw_doc["tags"])
+                tags = tuple(str(tag) for tag in raw_doc.get("tags", []))
+                links = tuple(str(link) for link in raw_doc.get("links", []))
+                tokens = tuple(str(token) for token in raw_doc.get("tokens", []))
                 index._documents[doc_id] = Document(
                     doc_id=doc_id,
                     url=url,
                     fields=extents,
                     tags=tags,
+                    links=links,
+                    tokens=tokens,
                 )
                 index._url_to_id[url] = doc_id
 

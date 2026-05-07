@@ -11,7 +11,7 @@ from typing import TextIO
 
 from src.crawler import DEFAULT_DELAY, PoliteCrawler
 from src.indexer import InvertedIndex
-from src.search import explain, find, print_entry
+from src.search import explain, print_entry, result_details
 
 DEFAULT_START_URL = "https://quotes.toscrape.com/"
 DEFAULT_INDEX_PATH = Path("data/index.json")
@@ -152,13 +152,15 @@ class SearchShell:
             self._write("Usage: find <word> [word ...]")
             return
 
-        results = find(self.index, query)
+        results = result_details(self.index, query)
         if not results:
-            self._write(f"No pages found for {query!r}")
+            self._write(f"No pages found for: {query}")
             return
 
-        for url in results:
-            self._write(url)
+        for result in results:
+            self._write(f"{result.url}  score={result.score:.1f}")
+            if result.snippet:
+                self._write(f"  {result.snippet}")
 
     def _explain(self, query: str) -> None:
         if self.index is None:

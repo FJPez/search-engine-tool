@@ -153,6 +153,15 @@ class _ParsedQuery:
     phrases: list[list[str]]
 
 
+@dataclass(frozen=True, slots=True)
+class SearchResult:
+    """One ranked search result with display metadata for the CLI."""
+
+    url: str
+    score: float
+    snippet: str
+
+
 def _parse_query(query: str) -> _ParsedQuery:
     """Split raw query text into normal terms and ``tag:`` filters."""
     phrases: list[list[str]] = []
@@ -213,7 +222,12 @@ def _phrase_doc_ids(index: InvertedIndex, phrase: list[str]) -> set[int]:
     return matches
 
 
-def _score_doc(index: InvertedIndex, doc_id: int, parsed: _ParsedQuery) -> float:
+def _score_doc(
+    index: InvertedIndex,
+    doc_id: int,
+    parsed: _ParsedQuery,
+    pageranks: dict[int, float] | None = None,
+) -> float:
     """Return a simple explainable relevance score for one matched document."""
     score = 0.0
 
@@ -237,7 +251,52 @@ def _score_doc(index: InvertedIndex, doc_id: int, parsed: _ParsedQuery) -> float
         if tag in document.tags:
             score += 2.0
 
-    return score
+    if pageranks is None:
+        pageranks = _pagerank_scores(index)
+    return score + pageranks.get(doc_id, 0.0)
+
+
+def _pagerank_scores(
+    index: InvertedIndex,
+    *,
+    damping: float = 0.85,
+    iterations: int = 20,
+) -> dict[int, float]:
+    """Return PageRank scores over the indexed page link graph."""
+    doc_ids = set(index.documents)
+    if not doc_ids:
+        return {}
+
+    url_to_doc_id = {document.url: doc_id for doc_id, document in index.documents.items()}
+    outgoing = {
+        doc_id: {
+            url_to_doc_id[link]
+            for link in document.links
+            if link in url_to_doc_id and url_to_doc_id[link] != doc_id
+        }
+        for doc_id, document in index.documents.items()
+    }
+
+    count = len(doc_ids)
+    ranks = dict.fromkeys(doc_ids, 1.0 / count)
+    base = (1.0 - damping) / count
+
+    for _ in range(iterations):
+        next_ranks = dict.fromkeys(doc_ids, base)
+        sink_rank = sum(ranks[doc_id] for doc_id, links in outgoing.items() if not links)
+        sink_share = damping * sink_rank / count
+        for doc_id in doc_ids:
+            next_ranks[doc_id] += sink_share
+
+        for source_id, links in outgoing.items():
+            if not links:
+                continue
+            share = damping * ranks[source_id] / len(links)
+            for target_id in links:
+                next_ranks[target_id] += share
+        ranks = next_ranks
+
+    return ranks
 
 
 def find(index: InvertedIndex, query: str) -> list[str]:
@@ -282,11 +341,50 @@ def find(index: InvertedIndex, query: str) -> list[str]:
         if not matched_doc_ids:
             return []
 
+    pageranks = _pagerank_scores(index)
     ranked_doc_ids = sorted(
         matched_doc_ids,
-        key=lambda doc_id: (-_score_doc(index, doc_id, parsed), doc_id),
+        key=lambda doc_id: (-_score_doc(index, doc_id, parsed, pageranks), doc_id),
     )
     return [documents[doc_id].url for doc_id in ranked_doc_ids]
+
+
+def result_details(index: InvertedIndex, query: str) -> list[SearchResult]:
+    """Return ranked results with scores and compact text snippets."""
+    parsed = _parse_query(query)
+    if not parsed.terms and not parsed.tags and not parsed.phrases:
+        return []
+
+    documents = index.documents
+    if parsed.terms:
+        posting_lists = [index.lookup(token) for token in parsed.terms]
+        matched_doc_ids = set(_intersect_postings(posting_lists))
+    else:
+        matched_doc_ids = set(documents)
+
+    for phrase in parsed.phrases:
+        matched_doc_ids &= _phrase_doc_ids(index, phrase)
+        if not matched_doc_ids:
+            return []
+
+    for tag in parsed.tags:
+        matched_doc_ids &= index.documents_with_tag(tag)
+        if not matched_doc_ids:
+            return []
+
+    pageranks = _pagerank_scores(index)
+    ranked_doc_ids = sorted(
+        matched_doc_ids,
+        key=lambda doc_id: (-_score_doc(index, doc_id, parsed, pageranks), doc_id),
+    )
+    return [
+        SearchResult(
+            url=documents[doc_id].url,
+            score=_score_doc(index, doc_id, parsed, pageranks),
+            snippet=_snippet(index, doc_id, parsed),
+        )
+        for doc_id in ranked_doc_ids
+    ]
 
 
 def explain(index: InvertedIndex, query: str) -> str:
@@ -314,13 +412,16 @@ def explain(index: InvertedIndex, query: str) -> str:
     for tag in parsed.tags:
         matched_doc_ids &= index.documents_with_tag(tag)
 
+    pageranks = _pagerank_scores(index)
     ranked_doc_ids = sorted(
         matched_doc_ids,
-        key=lambda doc_id: (-_score_doc(index, doc_id, parsed), doc_id),
+        key=lambda doc_id: (-_score_doc(index, doc_id, parsed, pageranks), doc_id),
     )
     lines.append(f"matches: {len(ranked_doc_ids)}")
     for doc_id in ranked_doc_ids:
-        lines.append(f"  {documents[doc_id].url}  score={_score_doc(index, doc_id, parsed):.1f}")
+        lines.append(
+            f"  {documents[doc_id].url}  score={_score_doc(index, doc_id, parsed, pageranks):.1f}"
+        )
     return "\n".join(lines)
 
 
@@ -332,6 +433,65 @@ def _format_phrases(phrases: list[list[str]]) -> str:
     if not phrases:
         return "(none)"
     return ", ".join(" ".join(phrase) for phrase in phrases)
+
+
+def _snippet(index: InvertedIndex, doc_id: int, parsed: _ParsedQuery) -> str:
+    """Return a short token snippet around the first matched query element."""
+    document = index.documents[doc_id]
+    if not document.tokens:
+        return ""
+
+    match_position = _first_match_position(index, doc_id, parsed)
+    if match_position is None:
+        match_position = document.fields.get("body", (0, len(document.tokens)))[0]
+
+    start = max(0, match_position - 4)
+    end = min(len(document.tokens), match_position + 8)
+    words = list(document.tokens[start:end])
+    snippet = " ".join(words)
+    if start > 0:
+        snippet = f"... {snippet}"
+    if end < len(document.tokens):
+        snippet = f"{snippet} ..."
+    return snippet
+
+
+def _first_match_position(index: InvertedIndex, doc_id: int, parsed: _ParsedQuery) -> int | None:
+    for phrase in parsed.phrases:
+        position = _first_phrase_position(index, doc_id, phrase)
+        if position is not None:
+            return position
+
+    for term in parsed.terms:
+        for posting in index.lookup(term):
+            if posting.doc_id == doc_id:
+                return posting.positions[0] if posting.positions else None
+
+    return None
+
+
+def _first_phrase_position(index: InvertedIndex, doc_id: int, phrase: list[str]) -> int | None:
+    if not phrase:
+        return None
+
+    postings: list[Posting] = []
+    for term in phrase:
+        posting = next(
+            (candidate for candidate in index.lookup(term) if candidate.doc_id == doc_id),
+            None,
+        )
+        if posting is None:
+            return None
+        postings.append(posting)
+
+    following_positions = [set(posting.positions) for posting in postings[1:]]
+    for start_position in postings[0].positions:
+        if all(
+            start_position + offset + 1 in following_positions[offset]
+            for offset in range(len(following_positions))
+        ):
+            return start_position
+    return None
 
 
 def print_entry(index: InvertedIndex, word: str) -> str:

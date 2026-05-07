@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.indexer import InvertedIndex, Posting
-from src.search import _intersect_postings, explain, find, print_entry
+from src.search import _intersect_postings, explain, find, print_entry, result_details
 from tests.conftest import HtmlFactory, SingleDocIndexFactory
 
 
@@ -290,6 +290,21 @@ def test_find_ranks_stronger_term_frequency_before_crawl_order(html: HtmlFactory
     assert find(idx, "good") == ["http://q/2", "http://q/3", "http://q/1"]
 
 
+def test_find_uses_pagerank_to_break_equal_text_scores(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/source",
+                html(body='hub <a href="http://q/popular">popular</a>'),
+            ),
+            ("http://q/plain", html(body="shared")),
+            ("http://q/popular", html(body="shared")),
+        ]
+    )
+
+    assert find(idx, "shared") == ["http://q/popular", "http://q/plain"]
+
+
 def test_explain_includes_parsed_query_and_scores(html: HtmlFactory) -> None:
     idx = InvertedIndex.from_pages(
         [
@@ -307,6 +322,30 @@ def test_explain_includes_parsed_query_and_scores(html: HtmlFactory) -> None:
     assert "tags: life" in output
     assert "http://q/1" in output
     assert "score=" in output
+
+
+def test_result_details_include_score_and_snippet(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body="alpha beta good friends gamma delta"),
+            )
+        ]
+    )
+
+    results = result_details(idx, '"good friends"')
+
+    assert len(results) == 1
+    assert results[0].url == "http://q/1"
+    assert results[0].score > 0
+    assert results[0].snippet == "alpha beta good friends gamma delta"
+
+
+def test_result_details_empty_snippet_when_query_has_no_match(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages([("http://q/1", html(body="alpha beta"))])
+
+    assert result_details(idx, "missing") == []
 
 
 # --------------------------------------------------------------------------

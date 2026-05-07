@@ -202,6 +202,14 @@ def test_lookup_counts_and_positions_for_single_document(
     assert idx.lookup("t") == [Posting(doc_id=0, count=1, positions=(0,))]
 
 
+def test_add_document_stores_token_stream_for_snippets(
+    single_doc_index: SingleDocIndexFactory,
+) -> None:
+    idx = single_doc_index(title="Title Text", body="good friends stay close")
+
+    assert idx.documents[0].tokens == ("title", "text", "good", "friends", "stay", "close")
+
+
 def test_lookup_aggregates_across_documents(html: HtmlFactory) -> None:
     idx = InvertedIndex()
     idx.add_document("http://a/", html(body="good good"))
@@ -242,6 +250,14 @@ def test_add_document_stores_tags(html: HtmlFactory) -> None:
     body = '<div class="quote"><a class="tag">life</a><a class="tag">humor</a></div>'
     idx.add_document("http://q/", html(body=body))
     assert idx.documents[0].tags == ("life", "humor")
+
+
+def test_add_document_stores_outgoing_links(html: HtmlFactory) -> None:
+    idx = InvertedIndex()
+    body = '<a href="/page/2/">Next</a><a href="https://other.test/">Other</a>'
+    idx.add_document("http://q/", html(body=body))
+
+    assert idx.documents[0].links == ("http://q/page/2", "https://other.test/")
 
 
 def test_documents_with_tag_returns_matching_doc_ids(html: HtmlFactory) -> None:
@@ -369,6 +385,24 @@ def test_save_writes_tags(tmp_path: Path, html: HtmlFactory) -> None:
     idx.save(target)
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["documents"]["0"]["tags"] == ["life"]
+
+
+def test_save_writes_outgoing_links(tmp_path: Path, html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages([("http://q/", html(body='<a href="/page/2/">Next</a>'))])
+    target = tmp_path / "index.json"
+    idx.save(target)
+
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["documents"]["0"]["links"] == ["http://q/page/2"]
+
+
+def test_save_writes_token_stream(tmp_path: Path, single_doc_index: SingleDocIndexFactory) -> None:
+    idx = single_doc_index(title="Title", body="good friends")
+    target = tmp_path / "index.json"
+    idx.save(target)
+
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["documents"]["0"]["tokens"] == ["title", "good", "friends"]
 
 
 def test_save_preserves_unicode_tokens_unescaped(
