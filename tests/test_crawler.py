@@ -256,6 +256,18 @@ class FakeRobots(RobotsPolicy):
         return self._crawl_delay
 
 
+class BrokenCanFetchRobots(FakeRobots):
+    def can_fetch(self, useragent: str, url: str) -> bool:
+        del useragent, url
+        raise ValueError("bad robots rule")
+
+
+class BrokenCrawlDelayRobots(FakeRobots):
+    def crawl_delay(self, useragent: str) -> int | float | None:
+        del useragent
+        raise TypeError("bad crawl delay")
+
+
 @pytest.fixture
 def crawler_factory() -> CrawlerFactory:
     """Build a :class:`PoliteCrawler` with injected fakes for sleep and clock.
@@ -614,6 +626,20 @@ def test_crawl_bypasses_robots_when_disabled(
     assert robots.checked_urls == []
 
 
+def test_crawl_continues_when_robots_can_fetch_errors(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    robots = BrokenCanFetchRobots()
+    requests_mock.get(BASE_URL, text=_html_with_links())
+    crawler = crawler_factory(respect_robots=True, robot_parser=robots)
+
+    with caplog.at_level(logging.WARNING, logger="src.crawler"):
+        results = [url for url, _ in crawler.crawl()]
+
+    assert results == [BASE_URL]
+    assert "Could not evaluate robots.txt rule" in caplog.text
+
+
 def test_crawl_uses_robots_crawl_delay_when_it_is_larger_than_default(
     requests_mock: Mocker, crawler_factory: CrawlerFactory
 ) -> None:
@@ -652,6 +678,28 @@ def test_crawl_ignores_robots_crawl_delay_below_coursework_minimum(
     list(crawler.crawl())
 
     assert sleep_calls == [6.0]
+
+
+def test_crawl_uses_default_delay_when_robots_crawl_delay_errors(
+    requests_mock: Mocker, crawler_factory: CrawlerFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    sleep_calls: list[float] = []
+    robots = BrokenCrawlDelayRobots()
+    page2 = f"{BASE_URL}page/2"
+    requests_mock.get(BASE_URL, text=_html_with_links(page2))
+    requests_mock.get(page2, text=_html_with_links())
+    crawler = crawler_factory(
+        delay=6.0,
+        sleep_calls=sleep_calls,
+        respect_robots=True,
+        robot_parser=robots,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.crawler"):
+        list(crawler.crawl())
+
+    assert sleep_calls == [6.0]
+    assert "Could not read robots.txt crawl delay" in caplog.text
 
 
 def test_crawl_continues_when_robots_txt_is_missing(

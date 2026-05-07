@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from src.indexer import InvertedIndex, Posting
-from src.search import _intersect_postings, explain, find, print_entry, result_details
+from src.search import (
+    _intersect_postings,
+    _pagerank_scores,
+    explain,
+    find,
+    print_entry,
+    result_details,
+)
 from tests.conftest import HtmlFactory, SingleDocIndexFactory
 
 
@@ -305,6 +312,22 @@ def test_find_uses_pagerank_to_break_equal_text_scores(html: HtmlFactory) -> Non
     assert find(idx, "shared") == ["http://q/popular", "http://q/plain"]
 
 
+def test_pagerank_ignores_self_links_and_unindexed_links(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='shared <a href="http://q/1">self</a> <a href="http://q/out">out</a>'),
+            ),
+            ("http://q/2", html(body="shared")),
+        ]
+    )
+
+    scores = _pagerank_scores(idx)
+
+    assert scores[0] == pytest.approx(scores[1])
+
+
 def test_explain_includes_parsed_query_and_scores(html: HtmlFactory) -> None:
     idx = InvertedIndex.from_pages(
         [
@@ -324,6 +347,17 @@ def test_explain_includes_parsed_query_and_scores(html: HtmlFactory) -> None:
     assert "score=" in output
 
 
+def test_explain_empty_query_reports_zero_matches(three_doc_index: InvertedIndex) -> None:
+    assert explain(three_doc_index, "") == "\n".join(
+        [
+            "terms: (none)",
+            "phrases: (none)",
+            "tags: (none)",
+            "matches: 0",
+        ]
+    )
+
+
 def test_result_details_include_score_and_snippet(html: HtmlFactory) -> None:
     idx = InvertedIndex.from_pages(
         [
@@ -340,6 +374,51 @@ def test_result_details_include_score_and_snippet(html: HtmlFactory) -> None:
     assert results[0].url == "http://q/1"
     assert results[0].score > 0
     assert results[0].snippet == "alpha beta good friends gamma delta"
+
+
+def test_result_details_snippet_uses_ellipses_for_middle_matches(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(
+                    body=(
+                        "zero one two three four five six seven eight nine "
+                        "ten eleven twelve thirteen fourteen fifteen sixteen"
+                    )
+                ),
+            )
+        ]
+    )
+
+    snippet = result_details(idx, "eight")[0].snippet
+
+    assert snippet.startswith("... ")
+    assert "eight nine ten" in snippet
+    assert snippet.endswith(" ...")
+
+
+def test_result_details_tag_only_query_uses_start_of_document_snippet(
+    html: HtmlFactory,
+) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(
+                    body=(
+                        'intro words before tag <div class="quote">'
+                        '<a class="tag">life</a></div> trailing text'
+                    )
+                ),
+            )
+        ]
+    )
+
+    results = result_details(idx, "tag:life")
+
+    assert len(results) == 1
+    assert results[0].snippet.startswith("intro words before tag")
 
 
 def test_result_details_empty_snippet_when_query_has_no_match(html: HtmlFactory) -> None:
