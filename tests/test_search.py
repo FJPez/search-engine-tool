@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from src.indexer import InvertedIndex, Posting
-from src.search import _intersect_postings, find, print_entry
+from src.search import (
+    _intersect_postings,
+    _pagerank_scores,
+    explain,
+    find,
+    print_entry,
+    result_details,
+)
 from tests.conftest import HtmlFactory, SingleDocIndexFactory
 
 
@@ -197,6 +204,227 @@ def test_find_repeated_term_in_query_is_idempotent(three_doc_index: InvertedInde
     # posting list with itself gives the same list back. Behaviourally
     # equivalent to the single-term query.
     assert find(three_doc_index, "good good") == find(three_doc_index, "good")
+
+
+def test_find_tag_filter_only_returns_tagged_documents(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body='<div class="quote"><a class="tag">life</a></div>')),
+            ("http://q/2", html(body='<div class="quote"><a class="tag">humor</a></div>')),
+            ("http://q/3", html(body='<div class="quote"><a class="tag">life</a></div>')),
+        ]
+    )
+
+    assert find(idx, "tag:life") == ["http://q/1", "http://q/3"]
+
+
+def test_find_text_and_tag_filter_must_both_match(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body='love <div class="quote"><a class="tag">life</a></div>')),
+            ("http://q/2", html(body='love <div class="quote"><a class="tag">humor</a></div>')),
+            ("http://q/3", html(body='truth <div class="quote"><a class="tag">life</a></div>')),
+        ]
+    )
+
+    assert find(idx, "love tag:life") == ["http://q/1"]
+
+
+def test_find_multiple_tag_filters_use_and_semantics(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(
+                    body=(
+                        '<div class="quote"><a class="tag">life</a><a class="tag">truth</a></div>'
+                    )
+                ),
+            ),
+            ("http://q/2", html(body='<div class="quote"><a class="tag">life</a></div>')),
+        ]
+    )
+
+    assert find(idx, "tag:life tag:truth") == ["http://q/1"]
+
+
+def test_find_invalid_tag_filter_does_not_crash(three_doc_index: InvertedIndex) -> None:
+    assert find(three_doc_index, "tag:") == []
+
+
+def test_find_quoted_phrase_requires_adjacent_positions(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body="good friends stay")),
+            ("http://q/2", html(body="good loyal friends")),
+            ("http://q/3", html(body="friends good")),
+        ]
+    )
+
+    assert find(idx, '"good friends"') == ["http://q/1"]
+
+
+def test_find_phrase_combines_with_terms_and_tags(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='kind good friends <div class="quote"><a class="tag">life</a></div>'),
+            ),
+            (
+                "http://q/2",
+                html(body='kind good friends <div class="quote"><a class="tag">humor</a></div>'),
+            ),
+            (
+                "http://q/3",
+                html(body='good friends <div class="quote"><a class="tag">life</a></div>'),
+            ),
+        ]
+    )
+
+    assert find(idx, 'kind "good friends" tag:life') == ["http://q/1"]
+
+
+def test_find_ranks_stronger_term_frequency_before_crawl_order(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            ("http://q/1", html(body="good")),
+            ("http://q/2", html(body="good good good")),
+            ("http://q/3", html(body="good good")),
+        ]
+    )
+
+    assert find(idx, "good") == ["http://q/2", "http://q/3", "http://q/1"]
+
+
+def test_find_uses_pagerank_to_break_equal_text_scores(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/source",
+                html(body='hub <a href="http://q/popular">popular</a>'),
+            ),
+            ("http://q/plain", html(body="shared")),
+            ("http://q/popular", html(body="shared")),
+        ]
+    )
+
+    assert find(idx, "shared") == ["http://q/popular", "http://q/plain"]
+
+
+def test_pagerank_ignores_self_links_and_unindexed_links(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='shared <a href="http://q/1">self</a> <a href="http://q/out">out</a>'),
+            ),
+            ("http://q/2", html(body="shared")),
+        ]
+    )
+
+    scores = _pagerank_scores(idx)
+
+    assert scores[0] == pytest.approx(scores[1])
+
+
+def test_explain_includes_parsed_query_and_scores(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='love good friends <div class="quote"><a class="tag">life</a></div>'),
+            )
+        ]
+    )
+
+    output = explain(idx, 'love "good friends" tag:life')
+
+    assert "terms: love" in output
+    assert "phrases: good friends" in output
+    assert "tags: life" in output
+    assert "http://q/1" in output
+    assert "score=" in output
+
+
+def test_explain_empty_query_reports_zero_matches(three_doc_index: InvertedIndex) -> None:
+    assert explain(three_doc_index, "") == "\n".join(
+        [
+            "terms: (none)",
+            "phrases: (none)",
+            "tags: (none)",
+            "matches: 0",
+        ]
+    )
+
+
+def test_result_details_include_score_and_snippet(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body="alpha beta good friends gamma delta"),
+            )
+        ]
+    )
+
+    results = result_details(idx, '"good friends"')
+
+    assert len(results) == 1
+    assert results[0].url == "http://q/1"
+    assert results[0].score > 0
+    assert results[0].snippet == "alpha beta good friends gamma delta"
+
+
+def test_result_details_snippet_uses_ellipses_for_middle_matches(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(
+                    body=(
+                        "zero one two three four five six seven eight nine "
+                        "ten eleven twelve thirteen fourteen fifteen sixteen"
+                    )
+                ),
+            )
+        ]
+    )
+
+    snippet = result_details(idx, "eight")[0].snippet
+
+    assert snippet.startswith("... ")
+    assert "eight nine ten" in snippet
+    assert snippet.endswith(" ...")
+
+
+def test_result_details_tag_only_query_uses_start_of_document_snippet(
+    html: HtmlFactory,
+) -> None:
+    idx = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(
+                    body=(
+                        'intro words before tag <div class="quote">'
+                        '<a class="tag">life</a></div> trailing text'
+                    )
+                ),
+            )
+        ]
+    )
+
+    results = result_details(idx, "tag:life")
+
+    assert len(results) == 1
+    assert results[0].snippet.startswith("intro words before tag")
+
+
+def test_result_details_empty_snippet_when_query_has_no_match(html: HtmlFactory) -> None:
+    idx = InvertedIndex.from_pages([("http://q/1", html(body="alpha beta"))])
+
+    assert result_details(idx, "missing") == []
 
 
 # --------------------------------------------------------------------------

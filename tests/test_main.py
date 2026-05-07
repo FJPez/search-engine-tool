@@ -159,9 +159,11 @@ def test_find_prints_matching_urls_one_per_line(tmp_path: Path, html: HtmlFactor
 
     assert shell.run_command("find good friends") is True
 
-    lines = output.getvalue().splitlines()
-    assert "http://q/1" in lines
-    assert "http://q/2" not in lines
+    text = output.getvalue()
+    assert "http://q/1" in text
+    assert "score=" in text
+    assert "good friends" in text
+    assert "http://q/2" not in text
 
 
 def test_find_prints_zero_results_message(tmp_path: Path, html: HtmlFactory) -> None:
@@ -170,7 +172,47 @@ def test_find_prints_zero_results_message(tmp_path: Path, html: HtmlFactory) -> 
 
     assert shell.run_command("find missing") is True
 
-    assert "No pages found" in output.getvalue()
+    assert "No pages found for: missing" in output.getvalue()
+
+
+def test_find_prints_readable_zero_results_message_for_quoted_query(
+    tmp_path: Path, html: HtmlFactory
+) -> None:
+    shell, output = _shell(tmp_path)
+    shell.index = InvertedIndex.from_pages([("http://q/1", html(body="good loyal friends"))])
+
+    assert shell.run_command('find "good friends"') is True
+
+    assert 'No pages found for: "good friends"' in output.getvalue()
+
+
+def test_explain_prints_query_explanation(tmp_path: Path, html: HtmlFactory) -> None:
+    shell, output = _shell(tmp_path)
+    shell.index = InvertedIndex.from_pages(
+        [
+            (
+                "http://q/1",
+                html(body='love good friends <div class="quote"><a class="tag">life</a></div>'),
+            )
+        ]
+    )
+
+    assert shell.run_command('explain love "good friends" tag:life') is True
+
+    text = output.getvalue()
+    assert "terms: love" in text
+    assert "phrases: good friends" in text
+    assert "tags: life" in text
+    assert "http://q/1" in text
+
+
+def test_explain_requires_query_terms(tmp_path: Path, html: HtmlFactory) -> None:
+    shell, output = _shell(tmp_path)
+    shell.index = InvertedIndex.from_pages([("http://q/1", html(body="good"))])
+
+    assert shell.run_command("explain") is True
+
+    assert "Usage: explain <query>" in output.getvalue()
 
 
 def test_unknown_command_prints_help_hint(tmp_path: Path) -> None:

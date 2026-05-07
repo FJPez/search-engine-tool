@@ -11,7 +11,7 @@ from typing import TextIO
 
 from src.crawler import DEFAULT_DELAY, PoliteCrawler
 from src.indexer import InvertedIndex
-from src.search import find, print_entry
+from src.search import explain, print_entry, result_details
 
 DEFAULT_START_URL = "https://quotes.toscrape.com/"
 DEFAULT_INDEX_PATH = Path("data/index.json")
@@ -58,6 +58,8 @@ class SearchShell:
                 self._print(argument)
             case "find":
                 self._find(argument)
+            case "explain":
+                self._explain(argument)
             case "verbose":
                 self._verbose(argument)
             case "help":
@@ -150,13 +152,25 @@ class SearchShell:
             self._write("Usage: find <word> [word ...]")
             return
 
-        results = find(self.index, query)
+        results = result_details(self.index, query)
         if not results:
-            self._write(f"No pages found for {query!r}")
+            self._write(f"No pages found for: {query}")
             return
 
-        for url in results:
-            self._write(url)
+        for result in results:
+            self._write(f"{result.url}  score={result.score:.1f}")
+            if result.snippet:
+                self._write(f"  {result.snippet}")
+
+    def _explain(self, query: str) -> None:
+        if self.index is None:
+            self._write("No index loaded. Run 'build' or 'load' first.")
+            return
+        if not query:
+            self._write("Usage: explain <query>")
+            return
+
+        self._write(explain(self.index, query))
 
     def _verbose(self, argument: str) -> None:
         if not argument:
@@ -179,7 +193,7 @@ class SearchShell:
     def _help(self) -> None:
         self._write(
             "Commands: build [max_pages], load, print <word>, "
-            "find <word> [word ...], verbose on|off, help, exit"
+            "find <query>, explain <query>, verbose on|off, help, exit"
         )
 
     def _write(self, message: str) -> None:

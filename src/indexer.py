@@ -112,10 +112,12 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from src.crawler import extract_links
+
 # Bumped whenever the on-disk JSON shape changes in a way that older loaders
 # can't handle. Loading a file with a different version is a hard error: it
 # is safer to refuse than to silently misinterpret stored fields.
-_INDEX_VERSION = 1
+_INDEX_VERSION = 2
 
 # Tags whose text content is never meaningful for search. Removing them up
 # front keeps the body stream clean of JS payloads, CSS rules and <noscript>
@@ -183,6 +185,29 @@ def extract_fields(html: str) -> dict[str, str]:
     return {"title": title, "body": body}
 
 
+def extract_tags(html: str) -> tuple[str, ...]:
+    """Return normalised quote tags extracted from *html*.
+
+    ``quotes.toscrape.com`` renders tags as ``<a class="tag">`` inside
+    ``<div class="quote">`` cards. Tags are normalised through
+    :func:`tokenise` so filtering uses the same case and punctuation policy
+    as normal search terms. Repeated tags are deduped in first-seen order.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    seen: set[str] = set()
+    tags: list[str] = []
+    for tag_link in soup.select("div.quote a.tag"):
+        tokens = tokenise(tag_link.get_text(" ", strip=True))
+        if not tokens:
+            continue
+        tag = tokens[0]
+        if tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+    return tuple(tags)
+
+
 @dataclass(frozen=True, slots=True)
 class Posting:
     """One inverted-index entry: a term's occurrences inside a single doc.
@@ -211,6 +236,9 @@ class Document:
     doc_id: int
     url: str
     fields: dict[str, tuple[int, int]] = field(default_factory=dict)
+    tags: tuple[str, ...] = ()
+    links: tuple[str, ...] = ()
+    tokens: tuple[str, ...] = ()
 
 
 class InvertedIndex:
@@ -241,8 +269,11 @@ class InvertedIndex:
             return self._url_to_id[url]
 
         fields = extract_fields(html)
+        tags = extract_tags(html)
+        links = tuple(extract_links(html, url))
         title_tokens = tokenise(fields["title"])
         body_tokens = tokenise(fields["body"])
+        tokens = tuple(title_tokens + body_tokens)
 
         title_end = len(title_tokens)
         body_end = title_end + len(body_tokens)
@@ -254,7 +285,14 @@ class InvertedIndex:
         doc_id = self._next_id
         self._next_id += 1
 
-        self._documents[doc_id] = Document(doc_id=doc_id, url=url, fields=extents)
+        self._documents[doc_id] = Document(
+            doc_id=doc_id,
+            url=url,
+            fields=extents,
+            tags=tags,
+            links=links,
+            tokens=tokens,
+        )
         self._url_to_id[url] = doc_id
 
         # Build per-term position lists in one pass over the combined stream,
@@ -301,6 +339,20 @@ class InvertedIndex:
                 return name
         return None
 
+    def documents_with_tag(self, tag: str) -> set[int]:
+        """Return doc_ids for documents containing *tag*.
+
+        Tags are normalised with :func:`tokenise`, matching the extraction
+        policy used when documents are added to the index.
+        """
+        tokens = tokenise(tag)
+        if not tokens:
+            return set()
+        normalised = tokens[0]
+        return {
+            doc_id for doc_id, document in self._documents.items() if normalised in document.tags
+        }
+
     @property
     def documents(self) -> dict[int, Document]:
         """The ``doc_id → Document`` catalogue."""
@@ -336,6 +388,9 @@ class InvertedIndex:
                 str(doc.doc_id): {
                     "url": doc.url,
                     "fields": {name: list(extent) for name, extent in doc.fields.items()},
+                    "tags": list(doc.tags),
+                    "links": list(doc.links),
+                    "tokens": list(doc.tokens),
                 }
                 for doc in self._documents.values()
             },
@@ -404,7 +459,7 @@ class InvertedIndex:
                     name: (int(extent[0]), int(extent[1]))
                     for name, extent in raw_doc["fields"].items()
                 }
-                # Every v1 document has both extents (see ``add_document``).
+                # Every v2 document has both extents (see ``add_document``).
                 # A subset would silently make ``field_of`` return ``None``
                 # for every position in the document — fail loudly instead.
                 missing = {"title", "body"} - extents.keys()
@@ -412,7 +467,17 @@ class InvertedIndex:
                     raise ValueError(
                         f"document {raw_id} is missing field extents: {sorted(missing)}"
                     )
-                index._documents[doc_id] = Document(doc_id=doc_id, url=url, fields=extents)
+                tags = tuple(str(tag) for tag in raw_doc.get("tags", []))
+                links = tuple(str(link) for link in raw_doc.get("links", []))
+                tokens = tuple(str(token) for token in raw_doc.get("tokens", []))
+                index._documents[doc_id] = Document(
+                    doc_id=doc_id,
+                    url=url,
+                    fields=extents,
+                    tags=tags,
+                    links=links,
+                    tokens=tokens,
+                )
                 index._url_to_id[url] = doc_id
 
             if index._documents:
